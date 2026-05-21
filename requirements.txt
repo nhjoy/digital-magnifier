@@ -1,0 +1,16 @@
+# Digital Magnifier — runtime dependencies (MVP 0.1)
+# ---------------------------------------------------
+# Pin to known-good major versions but allow patch updates.
+
+# Core image/array processing
+numpy>=1.24,<3.0
+opencv-python>=4.8,<5.0
+
+# Configuration
+PyYAML>=6.0,<7.0
+
+# Development / test dependencies
+# Install with: pip install -r requirements.txt -r requirements-dev.txt
+# (move these into requirements-dev.txt if you want them separated)
+pytest>=7.0
+pytest-cov>=4.0

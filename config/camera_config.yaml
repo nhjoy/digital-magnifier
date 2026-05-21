@@ -1,0 +1,48 @@
+# ------------------------------------------------------------------
+# Camera sensor configuration for the Digital Magnifier (MVP 0.1).
+# ------------------------------------------------------------------
+# Read by:
+#   - digital_magnifier.hal.camera_sensor.MockCameraSensor (MVP 0.1)
+#   - digital_magnifier.hal.pi_camera_sensor.PiCameraSensor (MVP 0.2,
+#     will reuse the same keys where possible).
+#
+# Resolution is the canonical source of truth. main.py injects
+# resolution into the app config that MagnifierApp receives, so
+# changing it here propagates to the placeholder frames as well.
+
+# --- Capture source -----------------------------------------------
+device:
+  # "webcam"     : open cv2.VideoCapture(index). Falls back to
+  #                fallback_image or synthetic frame on failure.
+  # "test_image" : skip the webcam entirely. Useful on WSL where
+  #                USB webcams are not exposed.
+  source: webcam
+
+  # Webcam device index. 0 is the default built-in camera on most
+  # laptops.
+  index: 0
+
+  # Optional path to a still image used as the camera output when
+  # no webcam is available. Resolved relative to the project root.
+  # If the file is missing, a procedurally-generated synthetic
+  # text-on-page frame is used instead (see MockCameraSensor).
+  fallback_image: assets/test_images/sample_text.png
+
+# --- Frame resolution ---------------------------------------------
+# Requested from the webcam (drivers may refuse and return a
+# different resolution; that's fine — the rest of the pipeline
+# adapts to whatever shape the frame is).
+resolution:
+  width: 1280
+  height: 720
+
+# --- Reserved for MVP 0.2 (Pi Camera Module 3) --------------------
+# These keys are documented now so the structure is stable when
+# the real sensor is wired in. MVP 0.1's MockCameraSensor ignores
+# them.
+pi_camera:
+  awb_mode: auto        # auto | sunlight | cloudy | tungsten | indoor
+  exposure: auto        # auto | normal | sport | night | backlight
+  rotation: 180         # degrees; 180 if the module is mounted upside-down
+  hflip: false
+  vflip: false

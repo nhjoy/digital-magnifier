@@ -1,0 +1,70 @@
+# ------------------------------------------------------------------
+# Application configuration for the Digital Magnifier (MVP 0.1).
+# ------------------------------------------------------------------
+# Read by:
+#   - digital_magnifier.core.app_controller.MagnifierApp
+#   - digital_magnifier.storage.image_saver.ImageSaver
+#   - digital_magnifier.utils.logger.setup_logging
+#
+# Camera resolution lives in camera_config.yaml (single source of
+# truth). main.py merges it into the dict passed to MagnifierApp.
+
+# --- Main loop and display ----------------------------------------
+app:
+  # Target frame rate. Higher = smoother; 24 is plenty for reading.
+  target_fps: 24
+  # Top status bar with state name, zoom level, filter indicator.
+  show_overlay: true
+
+# --- Digital zoom and pan -----------------------------------------
+magnifier:
+  # Zoom is digital (the camera doesn't move). 1.0 = no zoom.
+  min_zoom: 1.0
+  max_zoom: 8.0
+  # Step per ZOOM_IN / ZOOM_OUT event. With keyboard mock, every
+  # press is one step; with real pot in MVP 0.3, steps are
+  # generated as the pot crosses thresholds.
+  zoom_step: 0.5
+  default_zoom: 1.0
+  # Pan offset (normalised, -1..+1) per nav-switch event.
+  pan_step: 0.1
+
+# --- Vision filters -----------------------------------------------
+filters:
+  # The filter active at startup and after RESET_VIEW.
+  default: normal
+  # Order = cycle order when the user presses Filter Next.
+  # All names must exist in
+  # digital_magnifier.processing.vision_filters.AVAILABLE_FILTERS.
+  available:
+    - normal
+    - grayscale
+    - high_contrast
+    - inverted
+    - binary
+
+# --- Image capture ------------------------------------------------
+capture:
+  # Where capture_*.png files are written. Relative paths are
+  # resolved from wherever main.py was invoked.
+  output_directory: captures
+  file_format: png
+  # How long the white flash overlay stays on the screen after
+  # CAPTURE_IMAGE. 500 ms is long enough to feel like feedback,
+  # short enough not to delay the next read.
+  flash_duration_ms: 500
+
+# --- State machine ------------------------------------------------
+state_machine:
+  # Log every transition. Useful in dev; safe to leave on for
+  # MVP 0.1 since the volume is low (one line per user action).
+  log_transitions: true
+
+# --- Logging ------------------------------------------------------
+logging:
+  # DEBUG / INFO / WARNING / ERROR. Override with --log-level on
+  # the command line.
+  level: INFO
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  date_format: "%H:%M:%S"
+  use_stderr: false

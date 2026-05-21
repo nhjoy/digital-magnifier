@@ -1,0 +1,78 @@
+# ------------------------------------------------------------------
+# Hardware control mapping for the Digital Magnifier
+# ------------------------------------------------------------------
+# Two layers of mappings:
+#   - mock_keyboard_map: development / WSL bindings (key -> AppEvent)
+#   - gpio_pins:         real CM5 hardware (deferred until MVP 0.3)
+#
+# When swapping mock for real hardware, only the HAL implementation
+# changes; the AppEvent values produced are identical.
+
+hardware:
+  platform: "wsl_mock"   # "wsl_mock" or "raspberrypi_cm5"
+
+# ------------------------------------------------------------------
+# Mock keyboard mappings (used by hal/mock_controls.py)
+# ------------------------------------------------------------------
+# key (single character or known alias) -> AppEvent name. The event
+# name must exactly match an entry in
+# digital_magnifier.core.events.AppEvent.
+mock_keyboard_map:
+
+  # --- the six push buttons ------------------------------------
+  "space": FREEZE_TOGGLE        # button 1 (largest / most-used)
+  "c":     CAPTURE_IMAGE        # button 2
+  "f":     FILTER_NEXT          # button 3
+  "g":     GALLERY_OPEN         # button 4 (stub UI in MVP 0.1)
+  "r":     RESET_VIEW           # button 5 (zoom=1, pan=0, filter=normal)
+  "p":     POWER_SHORT_PRESS    # button 6 short press: toggle menu
+  "P":     POWER_LONG_PRESS     # button 6 long press: shutdown
+                                # (uses shift+p because cv2.waitKey
+                                # cannot reliably distinguish
+                                # short vs hold on a keyboard)
+
+  # --- navigation switch (4-way directional + centre press) -----
+  "w":     PAN_UP
+  "s":     PAN_DOWN
+  "a":     PAN_LEFT
+  "d":     PAN_RIGHT
+  "x":     RESET_VIEW           # nav-centre press shares the
+                                # reset event with button 5
+
+  # --- zoom potentiometer (mock = discrete step events) ---------
+  "+":     ZOOM_IN
+  "=":     ZOOM_IN              # same physical key as + without shift
+  "-":     ZOOM_OUT
+  "_":     ZOOM_OUT             # same physical key as - with shift
+
+  # --- mode navigation helpers ----------------------------------
+  "[":     BACK                 # explicit back/exit in gallery or menu
+
+  # --- developer convenience ------------------------------------
+  "q":     QUIT                 # clean exit during development;
+                                # bypasses power-button code path
+
+# ------------------------------------------------------------------
+# GPIO pin assignments (used by future GPIOControls HAL in MVP 0.3)
+# ------------------------------------------------------------------
+# Pin numbers are BCM. The TCA9535 expander is used if more pins are
+# needed than the CM5 exposes directly. These are placeholders;
+# adjust during MVP 0.3 to match the actual breadboard wiring.
+gpio_pins:
+  buttons:
+    freeze:      17
+    capture:     27
+    filter_next: 22
+    gallery:     23
+    reset_view:  24
+    power:       25
+  joystick:
+    up:     5
+    down:   6
+    left:   13
+    right:  19
+    centre: 26
+  zoom_potentiometer:
+    adc_channel: 0
+  power_button:
+    long_press_threshold_ms: 1000

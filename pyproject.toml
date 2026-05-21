@@ -1,0 +1,9 @@
+[project]
+name = "digital-magnifier"
+version = "0.1.0"
+description = "Portable digital magnifier mock application for Raspberry Pi CM5"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
