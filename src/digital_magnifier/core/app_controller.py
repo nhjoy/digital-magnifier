@@ -119,6 +119,7 @@ class MagnifierApp:
         app_cfg = config.get("app", {})
         self._target_fps: float = float(app_cfg.get("target_fps", 24))
         self._show_overlay: bool = bool(app_cfg.get("show_overlay", True))
+        self._fullscreen: bool = bool(app_cfg.get("fullscreen", False))
 
         mag_cfg = config.get("magnifier", {})
         self._zoom_min: float = float(mag_cfg.get("min_zoom", 1.0))
@@ -579,6 +580,12 @@ class MagnifierApp:
     def _display(self, frame: np.ndarray) -> None:
         if not self._window_opened:
             cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
+            if self._fullscreen:
+                cv2.setWindowProperty(
+                    self.WINDOW_NAME,
+                    cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN,
+                )
             self._window_opened = True
         cv2.imshow(self.WINDOW_NAME, frame)
 

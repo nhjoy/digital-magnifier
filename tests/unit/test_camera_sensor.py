@@ -1,9 +1,14 @@
-"""Unit tests for ``MockCameraSensor``.
+"""Unit tests for the camera sensor implementations.
 
-These tests don't require a real webcam. The fallback chain
-(webcam → fallback_image → synthetic frame) is verified by either
-forcing ``source: test_image`` (skips the webcam attempt) or by
-configuring a non-existent webcam index and letting the chain run.
+Covers both ``MockCameraSensor`` and ``PiCameraSensor`` (in the
+same module since both classes now live in ``camera_sensor.py``).
+
+The Mock tests don't require a real webcam — they force
+``source: test_image`` to take the fallback/synthetic path. The Pi
+tests don't require ``picamera2`` to be installed — they use the
+dependency-injection points on ``PiCameraSensor`` to supply fake
+``picamera2`` and ``libcamera`` modules built with
+``types.SimpleNamespace`` and ``unittest.mock.MagicMock``.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import pytest
 from digital_magnifier.hal.camera_base import CameraError
 from digital_magnifier.hal.camera_sensor import (
     MockCameraSensor,
+    PiCameraSensor,
     _MODE_SYNTHETIC,
     _MODE_FALLBACK_IMAGE,
     _MODE_STOPPED,
@@ -177,3 +183,356 @@ class TestWebcamPath:
         assert isinstance(frame, np.ndarray)
         assert frame.dtype == np.uint8
         cam.stop()
+
+
+# ===========================================================================
+# PiCameraSensor
+# ===========================================================================
+# Helpers to build fake picamera2 / libcamera modules so these tests run
+# without those Pi-only libraries installed.
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+
+def _make_fake_picam2(frame: np.ndarray | None = None) -> MagicMock:
+    """Mock that behaves like a Picamera2 instance."""
+    if frame is None:
+        frame = np.full((240, 320, 3), 128, dtype=np.uint8)
+    picam2 = MagicMock(name="Picamera2 instance")
+    picam2.capture_array.return_value = frame
+    return picam2
+
+
+def _make_fake_picamera2_module(picam2_instance: MagicMock) -> SimpleNamespace:
+    return SimpleNamespace(
+        Picamera2=MagicMock(return_value=picam2_instance, name="Picamera2 class"),
+    )
+
+
+def _make_fake_libcamera_module() -> SimpleNamespace:
+    """Stand-in for libcamera with enum and Transform shapes."""
+    AwbModeEnum = SimpleNamespace(
+        Auto="awb_auto",
+        Incandescent="awb_incandescent",
+        Tungsten="awb_tungsten",
+        Fluorescent="awb_fluorescent",
+        Indoor="awb_indoor",
+        Daylight="awb_daylight",
+        Cloudy="awb_cloudy",
+    )
+    AeExposureModeEnum = SimpleNamespace(
+        Normal="ae_normal",
+        Short="ae_short",
+        Long="ae_long",
+    )
+    HdrModeEnum = SimpleNamespace(
+        Off="hdr_off",
+        SingleExposure="hdr_single",
+        Night="hdr_night",
+    )
+    AfModeEnum = SimpleNamespace(
+        Manual="af_manual",
+        Auto="af_auto",
+        Continuous="af_continuous",
+    )
+    controls = SimpleNamespace(
+        AwbModeEnum=AwbModeEnum,
+        AeExposureModeEnum=AeExposureModeEnum,
+        HdrModeEnum=HdrModeEnum,
+        AfModeEnum=AfModeEnum,
+    )
+
+    def Transform(hflip: bool = False, vflip: bool = False):
+        return SimpleNamespace(hflip=hflip, vflip=vflip)
+
+    return SimpleNamespace(Transform=Transform, controls=controls)
+
+
+@pytest.fixture
+def fake_picam2():
+    return _make_fake_picam2()
+
+
+@pytest.fixture
+def fake_picamera2_module(fake_picam2):
+    return _make_fake_picamera2_module(fake_picam2)
+
+
+@pytest.fixture
+def fake_libcamera_module():
+    return _make_fake_libcamera_module()
+
+
+@pytest.fixture
+def pi_config():
+    return {
+        "resolution": {"width": 1280, "height": 720},
+        "pi_camera": {
+            "awb_mode": "auto",
+            "ae_mode": "normal",
+            "hdr": "off",
+            "rotation": 0,
+            "hflip": False,
+            "vflip": False,
+            "format": "RGB888",
+        },
+    }
+
+
+def _make_pi_sensor(config, picam2_mod, libcam_mod):
+    return PiCameraSensor(
+        config,
+        picamera2_module=picam2_mod,
+        libcamera_module=libcam_mod,
+    )
+
+
+class TestPiConstruction:
+    def test_minimal_config(self):
+        sensor = PiCameraSensor({})
+        assert sensor._width == 1280
+        assert sensor._height == 720
+        assert sensor._awb_mode == "auto"
+
+    def test_reads_resolution(self):
+        sensor = PiCameraSensor({"resolution": {"width": 640, "height": 480}})
+        assert sensor._width == 640
+        assert sensor._height == 480
+
+    def test_rotation_90_sets_sw_code(self, pi_config):
+        pi_config["pi_camera"]["rotation"] = 90
+        sensor = PiCameraSensor(pi_config)
+        assert sensor._sw_rotation_code is not None
+
+    def test_rotation_180_no_sw_code(self, pi_config):
+        pi_config["pi_camera"]["rotation"] = 180
+        sensor = PiCameraSensor(pi_config)
+        assert sensor._sw_rotation_code is None
+
+    def test_rotation_270_sets_sw_code(self, pi_config):
+        pi_config["pi_camera"]["rotation"] = 270
+        sensor = PiCameraSensor(pi_config)
+        assert sensor._sw_rotation_code is not None
+
+
+class TestPiStart:
+    def test_calls_picamera2_constructor(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module
+    ):
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        fake_picamera2_module.Picamera2.assert_called_once_with()
+
+    def test_configures_resolution(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        kwargs = fake_picam2.create_video_configuration.call_args.kwargs
+        assert kwargs["main"]["size"] == (1280, 720)
+        assert kwargs["main"]["format"] == "RGB888"
+
+    def test_starts_camera(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        fake_picam2.configure.assert_called_once()
+        fake_picam2.start.assert_called_once()
+
+    def test_awb_mode_passed_through(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        pi_config["pi_camera"]["awb_mode"] = "daylight"
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        controls = fake_picam2.create_video_configuration.call_args.kwargs["controls"]
+        assert controls["AwbMode"] == "awb_daylight"
+
+    def test_hdr_off_not_emitted(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        pi_config["pi_camera"]["hdr"] = "off"
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        controls = (
+            fake_picam2.create_video_configuration.call_args.kwargs.get("controls")
+            or {}
+        )
+        assert "HdrMode" not in controls
+
+    def test_hdr_single_exposure_passed(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        pi_config["pi_camera"]["hdr"] = "single_exposure"
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        controls = fake_picam2.create_video_configuration.call_args.kwargs["controls"]
+        assert controls["HdrMode"] == "hdr_single"
+
+    def test_unknown_awb_logs_and_skips(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module,
+        fake_picam2, caplog,
+    ):
+        pi_config["pi_camera"]["awb_mode"] = "purple"
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        with caplog.at_level("WARNING"):
+            sensor.start()
+        controls = (
+            fake_picam2.create_video_configuration.call_args.kwargs.get("controls")
+            or {}
+        )
+        assert "AwbMode" not in controls
+        assert any("AWB mode" in r.message for r in caplog.records)
+
+    def test_rotation_180_sets_both_flips(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        pi_config["pi_camera"]["rotation"] = 180
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        transform = fake_picam2.create_video_configuration.call_args.kwargs["transform"]
+        assert transform.hflip is True
+        assert transform.vflip is True
+
+    def test_configure_failure_raises_camera_error(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        fake_picam2.configure.side_effect = RuntimeError("device busy")
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        with pytest.raises(CameraError, match="failed to start picamera2"):
+            sensor.start()
+
+    def test_af_mode_continuous_by_default(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        # Default config has no af_mode set -> sensor should pick "continuous"
+        pi_config["pi_camera"].pop("af_mode", None)
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        controls = fake_picam2.create_video_configuration.call_args.kwargs["controls"]
+        assert controls["AfMode"] == "af_continuous"
+
+    def test_af_mode_manual_with_lens_position(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        pi_config["pi_camera"]["af_mode"] = "manual"
+        pi_config["pi_camera"]["lens_position"] = 4.0
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        controls = fake_picam2.create_video_configuration.call_args.kwargs["controls"]
+        assert controls["AfMode"] == "af_manual"
+        assert controls["LensPosition"] == 4.0
+
+    def test_lens_position_ignored_when_not_manual(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        # lens_position set but af_mode is continuous -> position should be ignored
+        pi_config["pi_camera"]["af_mode"] = "continuous"
+        pi_config["pi_camera"]["lens_position"] = 4.0
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        controls = fake_picam2.create_video_configuration.call_args.kwargs["controls"]
+        assert "LensPosition" not in controls
+
+    def test_unknown_af_mode_logs_and_skips(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module,
+        fake_picam2, caplog,
+    ):
+        pi_config["pi_camera"]["af_mode"] = "telescopic"
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        with caplog.at_level("WARNING"):
+            sensor.start()
+        controls = (
+            fake_picam2.create_video_configuration.call_args.kwargs.get("controls")
+            or {}
+        )
+        assert "AfMode" not in controls
+        assert any("AF mode" in r.message for r in caplog.records)
+
+
+class TestPiStop:
+    def test_stop_after_start(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        sensor.stop()
+        fake_picam2.stop.assert_called_once()
+        fake_picam2.close.assert_called_once()
+
+    def test_stop_without_start_is_noop(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module
+    ):
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.stop()  # must not raise
+
+
+class TestPiGetFrame:
+    def test_returns_3channel(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module
+    ):
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        frame = sensor.get_frame()
+        assert frame.shape == (240, 320, 3)
+        assert frame.dtype == np.uint8
+
+    def test_strips_alpha_from_4channel(self, pi_config, fake_libcamera_module):
+        rgba_frame = np.zeros((240, 320, 4), dtype=np.uint8)
+        picam2 = _make_fake_picam2(rgba_frame)
+        sensor = _make_pi_sensor(
+            pi_config,
+            _make_fake_picamera2_module(picam2),
+            fake_libcamera_module,
+        )
+        sensor.start()
+        frame = sensor.get_frame()
+        assert frame.shape == (240, 320, 3)
+
+    def test_before_start_raises(self, pi_config):
+        sensor = PiCameraSensor(pi_config)
+        with pytest.raises(CameraError, match="not started"):
+            sensor.get_frame()
+
+    def test_capture_failure_raises_camera_error(self, pi_config, fake_libcamera_module):
+        picam2 = _make_fake_picam2()
+        picam2.capture_array.side_effect = RuntimeError("frame dropped")
+        sensor = _make_pi_sensor(
+            pi_config,
+            _make_fake_picamera2_module(picam2),
+            fake_libcamera_module,
+        )
+        sensor.start()
+        with pytest.raises(CameraError, match="capture_array failed"):
+            sensor.get_frame()
+
+
+class TestPiSoftwareRotation:
+    def test_rotation_90_swaps_shape(self, pi_config, fake_libcamera_module):
+        pi_config["pi_camera"]["rotation"] = 90
+        src = np.full((240, 320, 3), 128, dtype=np.uint8)
+        picam2 = _make_fake_picam2(src)
+        sensor = _make_pi_sensor(
+            pi_config,
+            _make_fake_picamera2_module(picam2),
+            fake_libcamera_module,
+        )
+        sensor.start()
+        frame = sensor.get_frame()
+        # After 90° rotation, shape (H, W, 3) becomes (W, H, 3).
+        assert frame.shape == (320, 240, 3)
+
+
+class TestPiDependencyResolution:
+    def test_missing_picamera2_raises_helpful_error(self, pi_config):
+        try:
+            import picamera2  # noqa: F401
+            pytest.skip("picamera2 is installed in this env")
+        except ImportError:
+            pass
+
+        sensor = PiCameraSensor(pi_config)
+        with pytest.raises(CameraError, match="picamera2 not available"):
+            sensor.start()

@@ -1,9 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "digital-magnifier"
-version = "0.1.0"
-description = "Portable digital magnifier mock application for Raspberry Pi CM5"
+name = "digital_magnifier"
+version = "0.2.0"
+description = "Portable digital magnifier for low-vision children (CM5-based)"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Pixi" }]
+keywords = ["accessibility", "low-vision", "magnifier", "raspberry-pi", "cm5"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Healthcare Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics :: Capture :: Digital Camera",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+# Runtime deps. picamera2 and the libcamera Python bindings are NOT
+# listed here because:
+#   - On the CM5 they should be installed via apt
+#     (python3-picamera2, python3-libcamera) — apt builds them
+#     against the system camera stack and gets the hardware-
+#     accelerated paths.
+#   - On WSL they aren't available and aren't needed (the mock
+#     camera takes over).
+# The platform-detect in main.py handles either case at runtime.
+dependencies = [
+    "numpy>=1.24,<3.0",
+    "opencv-python>=4.8,<5.0",
+    "PyYAML>=6.0,<7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+# After `pip install -e .` you can run:  digital-magnifier --log-level DEBUG
+digital-magnifier = "digital_magnifier.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+digital_magnifier = ["*.yaml"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
 testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

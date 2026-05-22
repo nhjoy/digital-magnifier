@@ -1,94 +1,126 @@
-# Digital Magnifier — MVP 0.1
+# Digital Magnifier
 
-Portable digital magnifier for low-vision children, built on a
-Raspberry Pi Compute Module 5. MVP 0.1 is the **software
-foundation**: the full application architecture runs on a laptop
-with keyboard-mocked controls, ready for real hardware to drop
-in during MVP 0.2 (Pi Camera) and MVP 0.3 (GPIO buttons + nav
-switch + pot).
+Portable digital magnifier for low-vision children, built on a Raspberry Pi
+Compute Module 5 with the Pi Camera Module 3.
 
-## What works in MVP 0.1
+**Current version: MVP 0.2** — real Pi camera input on the CM5.
 
-- Real-time digital zoom (1× to 8×) with digital pan
-- Five vision filters: normal, grayscale, high-contrast, inverted,
-  binary (adaptive threshold)
-- Freeze / unfreeze with frozen-frame cache (no re-processing
-  while paused)
-- Capture-to-disk with timestamped PNG filenames and visual flash
+## What works
+
+- Live magnified view from the Pi Camera Module 3 (or a USB webcam / synthetic
+  frame on a dev machine)
+- Digital zoom 1× to 8× with digital pan
+- Five vision filters: normal, grayscale, high-contrast (CLAHE),
+  inverted, binary (adaptive threshold)
+- Freeze / unfreeze with frozen-frame cache
+- Capture-to-disk with timestamped PNGs
 - Reset view (one-press return to defaults)
-- State machine with seven states and full transition table
-- Resilient main loop — bad frames, save failures, and handler
-  exceptions are logged but never crash the device
-- Mock camera with auto-fallback (webcam → fallback image →
-  procedurally-generated text-on-page)
-- Stub screens for gallery and menu (UI fills in MVP 0.4)
+- Resilient main loop — bad frames, save failures, and handler exceptions
+  are logged but never crash the device
+- Pi Cam 3 continuous autofocus, configurable AWB / AE / HDR / rotation
+- Fullscreen display on the DSI panel
+
+## Stubbed (deferred to later MVPs)
+
+- Gallery UI showing captured images (MVP 0.4)
+- Menu UI (MVP 0.4)
+- Real GPIO buttons + nav switch + ADC pot (MVP 0.3 — currently keyboard mock)
+- Accessibility polish, audio feedback (MVP 0.4)
+- systemd auto-start, watchdog, safe shutdown (MVP 0.5)
 
 ## Project layout
 
 ```
 digital-magnifier/
+├── pyproject.toml           # package definition + dependencies
+├── README.md
+├── requirements.txt         # convenience (pyproject is source of truth)
+├── .gitignore
 ├── config/
-│   ├── app_config.yaml          # app behaviour, filters, capture, logging
-│   ├── camera_config.yaml       # camera source & resolution
-│   └── hardware_pins.yaml       # mock keyboard + future GPIO map
+│   ├── app_config.yaml      # app behaviour, filters, capture, logging
+│   ├── camera_config.yaml   # camera source, resolution, Pi cam settings
+│   └── hardware_pins.yaml   # mock keyboard + future GPIO map
 ├── src/
 │   └── digital_magnifier/
-│       ├── main.py              # entry point
+│       ├── main.py
 │       ├── core/
-│       │   ├── app_controller.py # orchestrator
-│       │   ├── events.py         # AppEvent enum
+│       │   ├── app_controller.py    # main orchestrator
+│       │   ├── events.py            # AppEvent enum
 │       │   └── state_machine.py
 │       ├── hal/
-│       │   ├── camera_base.py    # ABC
-│       │   ├── camera_sensor.py  # MockCameraSensor
-│       │   ├── controls_base.py  # ABC
-│       │   └── mock_controls.py  # keyboard → AppEvent
+│       │   ├── camera_base.py       # CameraSensor ABC
+│       │   ├── camera_sensor.py     # MockCameraSensor + PiCameraSensor
+│       │   ├── controls_base.py     # ControlsHAL ABC
+│       │   └── mock_controls.py     # keyboard → AppEvent
 │       ├── processing/
-│       │   ├── magnifier.py      # apply_zoom (digital zoom + pan)
-│       │   └── vision_filters.py # filters incl. adaptive-threshold binary
+│       │   ├── magnifier.py         # apply_zoom (digital zoom + pan)
+│       │   └── vision_filters.py    # filters incl. adaptive-threshold binary
 │       ├── storage/
 │       │   └── image_saver.py
 │       └── utils/
 │           ├── config_loader.py
 │           └── logger.py
 ├── tests/
-│   └── unit/                    # ~100 pytest tests
-├── captures/                    # output of the capture button (gitignored)
-├── requirements.txt
-└── .gitignore
+│   └── unit/                # 100+ pytest tests
+└── captures/                # output of capture button (gitignored)
 ```
 
-## Quick start
+## Setup on the Raspberry Pi CM5
+
+This is the primary development and runtime environment.
 
 ```bash
-# 1) Create and activate a virtual environment
-python3 -m venv venv
-source venv/bin/activate          # Linux/macOS
-# or: .\venv\Scripts\activate    # Windows
+# 1) System dependencies (one-time, via apt — gets hardware-accelerated builds)
+sudo apt update && sudo apt full-upgrade -y
+sudo apt install -y \
+    python3-picamera2 \
+    python3-opencv \
+    python3-numpy \
+    python3-yaml \
+    python3-pytest \
+    git
 
-# 2) Install dependencies
-pip install -r requirements.txt
+# 2) Clone (one-time)
+mkdir -p ~/projects && cd ~/projects
+git clone https://github.com/<you>/digital-magnifier.git
+cd digital-magnifier
 
-# 3) Run the app
-PYTHONPATH=src python -m digital_magnifier.main
+# 3) Create a venv that can see the apt-installed picamera2
+python3 -m venv venv --system-site-packages
+source venv/bin/activate
+pip install -e ".[dev]"
 
-# Or: increase log verbosity
-PYTHONPATH=src python -m digital_magnifier.main --log-level DEBUG
+# 4) Sanity check
+pytest tests/ -v
+rpicam-hello --timeout 5000   # confirm the camera hardware is alive
+
+# 5) Run
+digital-magnifier --log-level INFO
 ```
 
-The application opens an OpenCV window titled "Digital Magnifier".
-**Click the window once** to give it keyboard focus, then use the
-keys below.
+The `--system-site-packages` flag is the important detail — it lets the venv
+see the apt-installed `python3-picamera2` and `python3-libcamera`. Without it
+the app falls back to the mock camera.
 
-If a webcam is available it will be used; otherwise a synthetic
-text-on-page frame is generated automatically (look for the red
-"SYNTHETIC TEST FRAME" watermark in the bottom-left).
+After step 3, you only need `source venv/bin/activate` at the start of each
+session. Add it to `~/.bashrc` if you want it automatic on SSH login.
 
-## Keyboard controls (mock)
+## Setup on a development machine (WSL / Linux / macOS, optional)
 
-These are the bindings in `config/hardware_pins.yaml`. They
-correspond to the six physical buttons + 4-way nav + pot that the
-real device will use in MVP 0.3.
+If you want to develop without the CM5 attached — useful for refactoring
+core logic — the same code runs with the mock camera:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -e ".[dev]"
+digital-magnifier --log-level INFO
+```
+
+Without picamera2 the app auto-detects this and uses `MockCameraSensor`
+(webcam if available, otherwise a procedurally-generated test frame).
+
+## Keyboard controls
 
 | Key       | Action                          | Notes                  |
 |-----------|---------------------------------|------------------------|
@@ -97,45 +129,52 @@ real device will use in MVP 0.3.
 | `f`       | Cycle filter                    | Button 3               |
 | `g`       | Open / close gallery (stub)     | Button 4               |
 | `r`       | Reset view                      | Button 5               |
-| `p`       | Power short press (toggle menu) | Button 6 short         |
-| `P`       | Power long press (shutdown)     | Button 6 long (shift+p)|
+| `p` / `P` | Power short / long press        | Button 6               |
 | `w/a/s/d` | Pan up/left/down/right          | Nav switch directional |
 | `x`       | Reset view                      | Nav switch centre      |
 | `+` / `=` | Zoom in                         | Pot increase           |
 | `-` / `_` | Zoom out                        | Pot decrease           |
 | `[`       | Back                            | Exit gallery / menu    |
-| `q`       | Quit (dev convenience)          |                        |
+| `q`       | Quit                            | Dev convenience        |
 
-## Running the tests
+In MVP 0.3 these map to real GPIO inputs; the events are identical.
+
+## Configuration
+
+Three YAML files in `config/` drive behaviour. All keys are documented
+inline; the most useful tweaks:
+
+- `camera_config.yaml` — `pi_camera.af_mode` (`continuous` / `manual`),
+  `pi_camera.lens_position` (manual focus distance in diopters),
+  `resolution.width/height` (default 2304×1296 uses the Pi Cam 3's
+  sweet-spot binned mode).
+- `app_config.yaml` — `app.fullscreen` (true on the CM5, false during
+  desktop dev), `capture.flash_duration_ms`, filter order in
+  `filters.available`.
+- `hardware_pins.yaml` — `hardware.platform: auto` is the default and
+  picks the right HAL automatically.
+
+## Running tests
 
 ```bash
-PYTHONPATH=src pytest tests/ -v
+pytest                       # everything
+pytest tests/unit/test_camera_sensor.py -v   # just the camera tests
+pytest tests/unit/test_camera_sensor.py::TestPiStart -v   # one class
 ```
 
-## Cleanup pass (one-time, recommended after dropping in MVP 0.1)
+## Development workflow
+
+Edit on the CM5 (via VS Code Remote-SSH or directly), test locally on the
+CM5 against the real camera, commit small and often:
 
 ```bash
-# Remove the legacy scratch directory shipped in the early zip
-rm -rf src/.temp
-
-# Remove all __pycache__ directories
-find . -type d -name "__pycache__" -exec rm -rf {} +
-
-# Convert any CRLF line endings to LF (requires dos2unix)
-find src/ tests/ config/ -type f \( -name "*.py" -o -name "*.yaml" \) -exec dos2unix {} +
+git add . && git commit -m "..." && git push
 ```
 
-## What's *not* in MVP 0.1
+The CM5's SD/eMMC is the single point of failure — push frequently. The
+`captures/` directory is gitignored; back it up separately with `rsync`
+if you need to preserve test images.
 
-Deferred to later MVPs:
+## License
 
-- MVP 0.2 — Real Pi Camera Module 3 via `picamera2`
-- MVP 0.3 — Real GPIO buttons + nav switch + ADC pot, including
-  edge-based long-press timing for the power button
-- MVP 0.4 — Real gallery UI, real menu UI, accessibility polish
-  (large indicators, audio feedback)
-- MVP 0.5 — systemd auto-start, watchdog, safe shutdown, power
-  monitoring, optional OCR/TTS
-
-The architecture is set up so each of these is mostly a HAL
-swap or a new module: nothing above the HAL needs to change.# digital-magnifer
+MIT.

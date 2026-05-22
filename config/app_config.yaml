@@ -15,6 +15,10 @@ app:
   target_fps: 24
   # Top status bar with state name, zoom level, filter indicator.
   show_overlay: true
+  # Open the OpenCV window in fullscreen. Set false during dev on
+  # a desktop where you have other windows you need to switch to.
+  # On the CM5 with the DSI display this should stay true.
+  fullscreen: true
 
 # --- Digital zoom and pan -----------------------------------------
 magnifier:

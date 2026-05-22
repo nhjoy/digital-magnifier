@@ -1,48 +1,98 @@
 # ------------------------------------------------------------------
-# Camera sensor configuration for the Digital Magnifier (MVP 0.1).
+# Camera sensor configuration for the Digital Magnifier.
 # ------------------------------------------------------------------
 # Read by:
-#   - digital_magnifier.hal.camera_sensor.MockCameraSensor (MVP 0.1)
-#   - digital_magnifier.hal.pi_camera_sensor.PiCameraSensor (MVP 0.2,
-#     will reuse the same keys where possible).
+#   - hal/camera_sensor.MockCameraSensor   (WSL / dev machine)
+#   - hal/pi_camera_sensor.PiCameraSensor  (Raspberry Pi CM5)
 #
-# Resolution is the canonical source of truth. main.py injects
-# resolution into the app config that MagnifierApp receives, so
-# changing it here propagates to the placeholder frames as well.
+# Resolution is the canonical source of truth. main.py also injects
+# it into the app config that MagnifierApp receives.
 
-# --- Capture source -----------------------------------------------
+# --- Capture source (used by MockCameraSensor only) ---------------
 device:
-  # "webcam"     : open cv2.VideoCapture(index). Falls back to
+  # MockCameraSensor source:
+  #   webcam     : open cv2.VideoCapture(index). Falls through to
   #                fallback_image or synthetic frame on failure.
-  # "test_image" : skip the webcam entirely. Useful on WSL where
+  #   test_image : skip the webcam entirely. Useful on WSL where
   #                USB webcams are not exposed.
   source: webcam
-
-  # Webcam device index. 0 is the default built-in camera on most
-  # laptops.
   index: 0
-
-  # Optional path to a still image used as the camera output when
-  # no webcam is available. Resolved relative to the project root.
-  # If the file is missing, a procedurally-generated synthetic
-  # text-on-page frame is used instead (see MockCameraSensor).
   fallback_image: assets/test_images/sample_text.png
 
 # --- Frame resolution ---------------------------------------------
-# Requested from the webcam (drivers may refuse and return a
-# different resolution; that's fine — the rest of the pipeline
-# adapts to whatever shape the frame is).
+# Pi Camera Module 3 sensor modes:
+#   1536x864   @ 120fps   (heavy 4x4 binning, softest)
+#   2304x1296  @  56fps   (2x2 binning, good balance — DEFAULT)
+#   4608x2592  @  14fps   (full sensor, no binning, slowest)
+#
+# We pick 2304x1296: 4x the pixel count of 1280x720, still well
+# above our 24 fps target, and gives digital zoom 4x more detail
+# to work with. The DSI display (1280x800) scales it down for
+# rendering, but the source data fed into apply_zoom() is what
+# determines how sharp zoomed views look.
+#
+# Used by both Mock and Pi camera sensors. MockCameraSensor's
+# webcam path requests this from cv2.VideoCapture (driver may
+# refuse); its synthetic frame is generated at this size.
 resolution:
-  width: 1280
-  height: 720
+  width: 2304
+  height: 1296
 
-# --- Reserved for MVP 0.2 (Pi Camera Module 3) --------------------
-# These keys are documented now so the structure is stable when
-# the real sensor is wired in. MVP 0.1's MockCameraSensor ignores
-# them.
+# --- Pi Camera Module 3 (used by PiCameraSensor on CM5) -----------
+# Ignored by MockCameraSensor. Tune these against your actual desk
+# setup; the defaults are reasonable for indoor reading at ~25 cm.
 pi_camera:
-  awb_mode: auto        # auto | sunlight | cloudy | tungsten | indoor
-  exposure: auto        # auto | normal | sport | night | backlight
-  rotation: 180         # degrees; 180 if the module is mounted upside-down
+
+  # White balance.
+  # auto         — good for most indoor lighting
+  # incandescent — warm bulbs
+  # tungsten     — older incandescent
+  # fluorescent  — overhead office tubes
+  # indoor       — mixed indoor
+  # daylight     — by a window
+  # cloudy       — overcast outdoor
+  awb_mode: auto
+
+  # Auto-exposure mode.
+  # normal — balanced (default)
+  # short  — minimise motion blur (good for shaky hands holding a page)
+  # long   — maximise light gathering (dim rooms; tolerates more blur)
+  ae_mode: normal
+
+  # HDR for the IMX708 sensor in Pi Camera Module 3.
+  # off              — no HDR
+  # single_exposure  — single-shot HDR, good for harsh desk-lamp lighting
+  # night            — low-light HDR mode
+  hdr: off
+
+  # Autofocus mode for the Pi Cam 3's motorised lens.
+  # continuous — lens continuously refocuses as content changes
+  #              (sensible default for a magnifier where the user
+  #              may move the page or move the device).
+  # auto       — focus once, then stay locked (faster, but the
+  #              lock can drift if working distance changes).
+  # manual     — lock the lens at a fixed distance set by
+  #              ``lens_position`` below.
+  af_mode: continuous
+
+  # Manual focus distance, in diopters (= 1 / distance_in_metres).
+  # Only used when ``af_mode: manual``.
+  #   4.0 → 25 cm    2.0 → 50 cm    1.0 → 1 m    0.0 → infinity
+  # Most useful when the camera is at a fixed working distance and
+  # you want to avoid autofocus hunting on patterned text.
+  # lens_position: 4.0
+
+  # Rotation in degrees. 0 and 180 are hardware-accelerated (free);
+  # 90 and 270 add a cv2 software rotation step (cheap but not free).
+  # Set 180 if the camera module is mounted upside-down on the stand.
+  rotation: 0
+
+  # Extra horizontal/vertical flip applied on top of rotation.
+  # Set hflip: true if you want a "mirror" view of the page.
   hflip: false
   vflip: false
+
+  # Pixel format. "RGB888" by Raspberry Pi convention delivers BGR-
+  # ordered data in numpy, which is what cv2.imshow expects. Don't
+  # change unless you really know why.
+  format: RGB888

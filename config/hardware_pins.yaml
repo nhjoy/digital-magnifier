@@ -9,7 +9,10 @@
 # changes; the AppEvent values produced are identical.
 
 hardware:
-  platform: "wsl_mock"   # "wsl_mock" or "raspberrypi_cm5"
+  platform: "auto"   # "auto" | "wsl_mock" | "raspberrypi_cm5"
+                     # "auto" probes for picamera2 at startup and
+                     # picks the right camera HAL — same YAML works
+                     # on WSL (mock) and on the CM5 (Pi camera).
 
 # ------------------------------------------------------------------
 # Mock keyboard mappings (used by hal/mock_controls.py)
