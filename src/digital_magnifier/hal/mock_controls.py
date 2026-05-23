@@ -1,11 +1,19 @@
-"""Mock controls HAL: keyboard input → AppEvent.
+"""Controls HAL implementations.
 
-Reads ``cv2.waitKey()`` and maps the result to an ``AppEvent`` using
-the ``mock_keyboard_map`` section of ``config/hardware_pins.yaml``.
-Used during development on laptops and in WSL. The future
-``GPIOControls`` (MVP 0.3) will produce the exact same events from
-real hardware so that everything above the HAL is unaffected by the
-swap.
+Two classes live in this module:
+
+- :class:`MockControls` — keyboard input → AppEvent, used during
+  development on laptops and in WSL.
+
+- :class:`GPIOControls` (MVP 0.3) — real hardware input via a
+  TCA6416A I/O expander (buttons + nav switch) and an optional
+  MCP3221 ADC (zoom potentiometer). Generates identical AppEvent
+  values, so the app controller, state machine, and everything
+  above the HAL are unaware of which one is plugged in.
+
+The filename "mock_controls.py" predates MVP 0.3 and is now slightly
+misleading. It is kept to avoid a rename per the project's
+no-rename rule; both implementations live here side by side.
 
 Design notes
 ------------
@@ -172,3 +180,498 @@ class MockControls(ControlsHAL):
                 key_str, key_code, existing.name, event.name,
             )
         self._key_code_to_event[key_code] = event
+
+
+# ===================================================================
+# GPIOControls — real hardware (MVP 0.3)
+# ===================================================================
+
+import time
+from collections import deque
+from typing import Optional
+
+from digital_magnifier.hal.i2c_devices import (
+    I2CError,
+    MCP3221,
+    TCA6416A,
+    pin_name_to_index,
+)
+
+
+class GPIOControls(ControlsHAL):
+    """Controls HAL backed by a TCA6416A I/O expander and optional MCP3221 ADC.
+
+    Reads:
+      * 5-way nav switch (P00..P04) → PAN_* / RESET_VIEW
+      * 6 action buttons (P05..P07, P10..P12) → app events per config
+      * Zoom pot via MCP3221 (optional) → ZOOM_IN / ZOOM_OUT
+
+    Press detection is edge-based: events fire on the HIGH→LOW
+    transition of an active-low input (button press), not while the
+    button is held. Nav directions optionally repeat while held for
+    "press and hold to pan further" UX.
+
+    The power button is special: short press → POWER_SHORT_PRESS on
+    release, long press → POWER_LONG_PRESS the moment the threshold
+    is crossed (so the user gets immediate feedback when they hold
+    for shutdown).
+
+    Internal event queue
+    --------------------
+    The :class:`ControlsHAL` contract is one event per :meth:`poll`
+    call. With 11 buttons and one ADC channel, a single poll can
+    legitimately produce multiple events (e.g. user starts pressing
+    two nav directions on the same I2C read). We buffer them in a
+    deque and drain one per poll, performing I2C reads only when the
+    deque is empty and enough time has elapsed since the last read.
+
+    Resilience
+    ----------
+    I2C failures during steady-state operation are logged at WARNING
+    and the read is skipped — the device does not crash if a wire
+    falls off. The first failure logs; subsequent identical failures
+    are rate-limited via ``_io_failure_logged`` to avoid log spam.
+    """
+
+    # Hard cap so a buggy YAML or stuck button can't fill memory.
+    _MAX_QUEUED_EVENTS = 64
+
+    def __init__(
+        self,
+        hardware_config: dict[str, Any],
+        io_expander: TCA6416A,
+        adc: Optional[MCP3221] = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._hardware_config = hardware_config
+        self._io_expander = io_expander
+        self._adc = adc
+        self._clock = clock
+
+        # ---- Resolved pin maps and event bindings ---------------
+        # input_name → linear pin index (0..15)
+        self._input_pins: dict[str, int] = {}
+        # Lookup masks keyed by input_name for quick state checks.
+        self._input_mask: dict[str, int] = {}
+        # Action buttons: input_name → AppEvent (fires on press edge)
+        self._button_events: dict[str, AppEvent] = {}
+        # Nav directions: input_name → AppEvent (fires on press, optionally repeats)
+        self._nav_events: dict[str, AppEvent] = {}
+
+        # ---- Power button special-casing ------------------------
+        self._power_input: Optional[str] = None
+        self._power_threshold_ms: int = 1000
+
+        # ---- Nav repeat config ----------------------------------
+        self._nav_repeat_enabled: bool = True
+        self._nav_repeat_initial_delay_s: float = 0.4
+        self._nav_repeat_interval_s: float = 0.1
+
+        # ---- Poll rate limit ------------------------------------
+        # Re-read I2C at most this often. The main loop calls poll()
+        # at the camera frame rate (~24 Hz), but several queued
+        # events may be drained per frame without re-reading.
+        self._poll_interval_s: float = 0.020   # 50 Hz default
+        self._last_poll_time: float = -1.0
+
+        # ---- Zoom pot config ------------------------------------
+        self._zoom_buckets: int = 16
+        self._zoom_invert: bool = False
+        self._zoom_debounce_reads: int = 2
+
+        # ---- Runtime state --------------------------------------
+        # Last observed input word from the expander, used for
+        # edge detection. -1 = "never read".
+        self._last_inputs: int = -1
+        # Per-input press start time (None = not pressed).
+        self._press_started: dict[str, Optional[float]] = {}
+        # Per-nav next repeat time (None = not held / not started).
+        self._nav_next_repeat: dict[str, Optional[float]] = {}
+        # Whether POWER_LONG_PRESS has already fired for the current hold.
+        self._power_long_fired: bool = False
+
+        # ---- Zoom pot tracking ----------------------------------
+        # Last bucket we emitted at. None = no read yet.
+        self._zoom_last_bucket: Optional[int] = None
+        # Candidate bucket (waiting to clear debounce) and how many
+        # consecutive reads we've seen it.
+        self._zoom_candidate_bucket: Optional[int] = None
+        self._zoom_candidate_reads: int = 0
+
+        # ---- Outbound event queue --------------------------------
+        self._pending: deque[AppEvent] = deque()
+
+        # ---- Error throttling -----------------------------------
+        self._io_failure_logged: bool = False
+
+        self._load_config()
+
+    # ----- ControlsHAL interface -------------------------------------
+
+    def start(self) -> None:
+        """Initialise the I/O expander (and probe the ADC if present)."""
+        try:
+            self._io_expander.init()
+        except I2CError:
+            logger.exception("TCA6416A init failed; GPIO controls unavailable")
+            raise
+
+        if self._adc is not None:
+            try:
+                self._adc.probe()
+                logger.info("MCP3221 ADC present; zoom pot enabled")
+            except I2CError as exc:
+                logger.warning(
+                    "MCP3221 probe failed (%s); zoom pot disabled until wired", exc
+                )
+                self._adc = None
+
+    def stop(self) -> None:
+        """Best-effort: turn the LEDs off."""
+        outputs = self._hardware_config.get("tca6416a_pins", {}).get("outputs", {})
+        try:
+            for pin_name in outputs.values():
+                try:
+                    index = pin_name_to_index(pin_name)
+                except ValueError:
+                    continue
+                # HIGH = LED off for common-anode wiring.
+                self._io_expander.write_output_pin(index, True)
+        except I2CError:
+            logger.debug("could not clear LED state on stop (probably OK)")
+
+    def poll(self) -> AppEvent:
+        # Pump the cv2 event queue so cv2.imshow() in the app controller
+        # actually refreshes the display. cv2.imshow needs periodic
+        # waitKey/pollKey calls to update the window; the main loop
+        # (see app_controller._tick) expects controls.poll() to do this.
+        # MockControls gets it for free via its keyboard reader;
+        # GPIOControls has to do it explicitly. Without this, the
+        # window stays black even though imshow is called every frame.
+        self._pump_display_events()
+
+        # If we already have queued events, drain one without an I2C read.
+        if self._pending:
+            return self._pending.popleft()
+
+        now = self._clock()
+        if (
+            self._last_poll_time >= 0
+            and (now - self._last_poll_time) < self._poll_interval_s
+        ):
+            return AppEvent.NONE
+        self._last_poll_time = now
+
+        # --- Read the I/O expander ----------------------------------
+        try:
+            inputs = self._io_expander.read_inputs()
+        except I2CError as exc:
+            if not self._io_failure_logged:
+                logger.warning("TCA6416A read failed (%s); skipping poll", exc)
+                self._io_failure_logged = True
+            return AppEvent.NONE
+        else:
+            if self._io_failure_logged:
+                logger.info("TCA6416A read recovered")
+                self._io_failure_logged = False
+
+        # --- Detect transitions vs previous read --------------------
+        if self._last_inputs == -1:
+            # First read: don't generate spurious events for any
+            # buttons that happen to be held while we initialised.
+            self._last_inputs = inputs
+        else:
+            self._process_transitions(self._last_inputs, inputs, now)
+            self._last_inputs = inputs
+
+        # --- Time-based events: long-press, nav repeat --------------
+        self._process_long_press(inputs, now)
+        self._process_nav_repeat(inputs, now)
+
+        # --- Read the ADC ------------------------------------------
+        if self._adc is not None:
+            self._process_zoom_pot()
+
+        # Cap queue length so a wedged button can't grow it forever.
+        while len(self._pending) > self._MAX_QUEUED_EVENTS:
+            self._pending.popleft()
+
+        if self._pending:
+            return self._pending.popleft()
+        return AppEvent.NONE
+
+    # ----- transition processing -------------------------------------
+
+    def _process_transitions(self, prev: int, curr: int, now: float) -> None:
+        # Walk every input pin we care about, compare its bit before
+        # and after, dispatch on the edge.
+        for name, pin_index in self._input_pins.items():
+            mask = self._input_mask[name]
+            was_pressed = (prev & mask) == 0
+            is_pressed = (curr & mask) == 0
+
+            if not was_pressed and is_pressed:
+                # Press edge (HIGH → LOW). Remember when it started.
+                self._press_started[name] = now
+                self._on_press(name, now)
+            elif was_pressed and not is_pressed:
+                # Release edge (LOW → HIGH).
+                self._on_release(name, now)
+                self._press_started[name] = None
+
+    def _on_press(self, name: str, now: float) -> None:
+        # Action buttons fire their event immediately on press.
+        if name in self._button_events:
+            self._queue(self._button_events[name])
+
+        # Nav directions: emit once on press; schedule the next
+        # repeat if held.
+        if name in self._nav_events:
+            self._queue(self._nav_events[name])
+            if self._nav_repeat_enabled:
+                self._nav_next_repeat[name] = now + self._nav_repeat_initial_delay_s
+            else:
+                self._nav_next_repeat[name] = None
+
+        # Power button: just record press; emit nothing yet.
+        if name == self._power_input:
+            self._power_long_fired = False
+
+    def _on_release(self, name: str, now: float) -> None:
+        if name == self._power_input:
+            # Short press only if we haven't already fired long.
+            if not self._power_long_fired:
+                press_start = self._press_started.get(name)
+                if press_start is not None:
+                    held_ms = (now - press_start) * 1000.0
+                    if held_ms < self._power_threshold_ms:
+                        self._queue(AppEvent.POWER_SHORT_PRESS)
+            self._power_long_fired = False
+
+        # Nav release: cancel any pending repeat.
+        if name in self._nav_events:
+            self._nav_next_repeat[name] = None
+
+    def _process_long_press(self, inputs: int, now: float) -> None:
+        if self._power_input is None or self._power_long_fired:
+            return
+        press_start = self._press_started.get(self._power_input)
+        if press_start is None:
+            return
+        # Confirm the button is still pressed (defensive: should
+        # always be true if press_started is set).
+        mask = self._input_mask.get(self._power_input)
+        if mask is None or (inputs & mask) != 0:
+            return
+        held_ms = (now - press_start) * 1000.0
+        if held_ms >= self._power_threshold_ms:
+            self._queue(AppEvent.POWER_LONG_PRESS)
+            self._power_long_fired = True
+
+    def _process_nav_repeat(self, inputs: int, now: float) -> None:
+        if not self._nav_repeat_enabled:
+            return
+        for name, event in self._nav_events.items():
+            next_at = self._nav_next_repeat.get(name)
+            if next_at is None:
+                continue
+            mask = self._input_mask[name]
+            if (inputs & mask) != 0:
+                # Not pressed any more; release handler clears the timer.
+                continue
+            if now >= next_at:
+                self._queue(event)
+                self._nav_next_repeat[name] = now + self._nav_repeat_interval_s
+
+    # ----- zoom pot --------------------------------------------------
+
+    def _process_zoom_pot(self) -> None:
+        try:
+            raw = self._adc.read_raw()  # type: ignore[union-attr]
+        except I2CError as exc:
+            logger.warning("MCP3221 read failed (%s); disabling zoom pot", exc)
+            self._adc = None
+            return
+
+        # Quantise to [0, buckets-1]. Use floor division so the
+        # bucket boundaries are evenly spaced across 0..4095.
+        bucket = (raw * self._zoom_buckets) // (MCP3221.MAX_RAW + 1)
+        if bucket >= self._zoom_buckets:
+            bucket = self._zoom_buckets - 1
+        if self._zoom_invert:
+            bucket = (self._zoom_buckets - 1) - bucket
+
+        # Debounce: only accept the new bucket once we've seen it
+        # for ``debounce_reads`` consecutive polls.
+        if bucket == self._zoom_candidate_bucket:
+            self._zoom_candidate_reads += 1
+        else:
+            self._zoom_candidate_bucket = bucket
+            self._zoom_candidate_reads = 1
+
+        if self._zoom_candidate_reads < self._zoom_debounce_reads:
+            return
+
+        # First-ever stable read just anchors the previous bucket.
+        if self._zoom_last_bucket is None:
+            self._zoom_last_bucket = bucket
+            return
+
+        if bucket > self._zoom_last_bucket:
+            for _ in range(bucket - self._zoom_last_bucket):
+                self._queue(AppEvent.ZOOM_IN)
+        elif bucket < self._zoom_last_bucket:
+            for _ in range(self._zoom_last_bucket - bucket):
+                self._queue(AppEvent.ZOOM_OUT)
+        self._zoom_last_bucket = bucket
+
+    # ----- helpers ---------------------------------------------------
+
+    def _queue(self, event: AppEvent) -> None:
+        if event is not AppEvent.NONE:
+            self._pending.append(event)
+
+    def _pump_display_events(self) -> None:
+        """Pump cv2's GUI event queue so the most recent imshow paints.
+
+        Lazy-imported so this module remains importable in environments
+        without cv2. Any failure (no window yet, headless CI, missing
+        backend) is swallowed silently — it just means the display
+        wasn't refreshed this tick, which is harmless.
+        """
+        try:
+            import cv2
+            cv2.waitKey(1)
+        except Exception:  # noqa: BLE001 — intentionally broad
+            pass
+
+    # ----- config loading --------------------------------------------
+
+    def _load_config(self) -> None:
+        cfg = self._hardware_config
+
+        # --- TCA6416A pin map -----------------------------------
+        pin_map = cfg.get("tca6416a_pins", {}).get("inputs", {})
+        for name, pin_name in pin_map.items():
+            try:
+                index = pin_name_to_index(pin_name)
+            except ValueError as exc:
+                logger.warning(
+                    "Skipping input %r: %s", name, exc
+                )
+                continue
+            self._input_pins[name] = index
+            self._input_mask[name] = 1 << index
+            self._press_started[name] = None
+
+        # --- Action buttons ------------------------------------
+        for name, event_name in cfg.get("button_events", {}).items():
+            if name not in self._input_pins:
+                logger.warning(
+                    "button_events references unknown input %r; ignoring", name
+                )
+                continue
+            event = self._parse_event(event_name, context=f"button {name!r}")
+            if event is not None:
+                self._button_events[name] = event
+
+        # --- Nav switch ----------------------------------------
+        for name, event_name in cfg.get("nav_events", {}).items():
+            if name not in self._input_pins:
+                logger.warning(
+                    "nav_events references unknown input %r; ignoring", name
+                )
+                continue
+            event = self._parse_event(event_name, context=f"nav {name!r}")
+            if event is not None:
+                self._nav_events[name] = event
+                self._nav_next_repeat[name] = None
+
+        # --- Nav repeat ---------------------------------------
+        repeat_cfg = cfg.get("nav_repeat", {})
+        self._nav_repeat_enabled = bool(repeat_cfg.get("enabled", True))
+        try:
+            self._nav_repeat_initial_delay_s = (
+                float(repeat_cfg.get("initial_delay_ms", 400)) / 1000.0
+            )
+            self._nav_repeat_interval_s = (
+                float(repeat_cfg.get("interval_ms", 100)) / 1000.0
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "nav_repeat has non-numeric timing; using defaults 400ms/100ms"
+            )
+            self._nav_repeat_initial_delay_s = 0.4
+            self._nav_repeat_interval_s = 0.1
+
+        # --- Power button -------------------------------------
+        power_cfg = cfg.get("power_button", {})
+        power_input = power_cfg.get("input")
+        if power_input:
+            if power_input in self._input_pins:
+                self._power_input = power_input
+                try:
+                    self._power_threshold_ms = int(
+                        power_cfg.get("long_press_threshold_ms", 1000)
+                    )
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "power_button.long_press_threshold_ms invalid; using 1000"
+                    )
+                    self._power_threshold_ms = 1000
+                self._press_started.setdefault(power_input, None)
+            else:
+                logger.warning(
+                    "power_button.input %r is not a defined input; "
+                    "power button disabled",
+                    power_input,
+                )
+
+        # --- Poll interval ------------------------------------
+        io_cfg = (
+            cfg.get("i2c", {}).get("devices", {}).get("io_expander", {})
+        )
+        try:
+            self._poll_interval_s = (
+                float(io_cfg.get("poll_interval_ms", 20)) / 1000.0
+            )
+        except (TypeError, ValueError):
+            logger.warning("io_expander.poll_interval_ms invalid; using 20ms")
+            self._poll_interval_s = 0.020
+
+        # --- Zoom pot calibration -----------------------------
+        zoom_cfg = cfg.get("zoom_pot", {})
+        try:
+            self._zoom_buckets = max(2, int(zoom_cfg.get("buckets", 16)))
+        except (TypeError, ValueError):
+            self._zoom_buckets = 16
+        self._zoom_invert = bool(zoom_cfg.get("invert", False))
+        try:
+            self._zoom_debounce_reads = max(
+                1, int(zoom_cfg.get("debounce_reads", 2))
+            )
+        except (TypeError, ValueError):
+            self._zoom_debounce_reads = 2
+
+        logger.info(
+            "GPIOControls: %d inputs, %d action buttons, %d nav directions, "
+            "power=%s, zoom_pot=%s",
+            len(self._input_pins),
+            len(self._button_events),
+            len(self._nav_events),
+            self._power_input,
+            "enabled" if self._adc is not None else "disabled",
+        )
+
+    def _parse_event(self, raw: Any, context: str) -> Optional[AppEvent]:
+        if not isinstance(raw, str):
+            logger.warning(
+                "%s: event must be a string, got %r", context, raw
+            )
+            return None
+        try:
+            return AppEvent[raw]
+        except KeyError:
+            logger.warning("%s: unknown AppEvent %r", context, raw)
+            return None

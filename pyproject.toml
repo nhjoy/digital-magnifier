@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "digital_magnifier"
-version = "0.2.0"
+version = "0.3.0"
 description = "Portable digital magnifier for low-vision children (CM5-based)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,11 +32,18 @@ classifiers = [
 #     accelerated paths.
 #   - On WSL they aren't available and aren't needed (the mock
 #     camera takes over).
+# smbus2 IS listed because:
+#   - It is pure-Python on top of /dev/i2c-N and installs cleanly
+#     from PyPI.
+#   - Tests use a fake bus, so smbus2 is not strictly required at
+#     test time, but listing it here ensures the CM5 picks it up
+#     via `pip install -e .`.
 # The platform-detect in main.py handles either case at runtime.
 dependencies = [
     "numpy>=1.24,<3.0",
     "opencv-python>=4.8,<5.0",
     "PyYAML>=6.0,<7.0",
+    "smbus2>=0.4,<1.0",
 ]
 
 [project.optional-dependencies]

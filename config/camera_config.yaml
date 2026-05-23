@@ -75,6 +75,24 @@ pi_camera:
   #              ``lens_position`` below.
   af_mode: continuous
 
+  # Autofocus range. The IMX708 lens can sweep its full range or be
+  # restricted to a near-field or far-field band; restricting the
+  # range makes the lock faster and prevents it hunting past the
+  # subject.
+  # normal — ~50 cm to infinity   (libcamera default)
+  # macro  — ~10 cm to ~50 cm     (RECOMMENDED for a magnifier;
+  #          small text on a page at arm's-length sits in this band)
+  # full   — entire range         (slowest, useful when working
+  #          distance varies wildly)
+  af_range: macro
+
+  # Autofocus speed.
+  # normal — gentler, less likely to oscillate on busy text
+  # fast   — quicker re-lock when you reposition the page;
+  #          best paired with ``af_range: macro`` so the search
+  #          window is small enough that "fast" doesn't overshoot
+  af_speed: fast
+
   # Manual focus distance, in diopters (= 1 / distance_in_metres).
   # Only used when ``af_mode: manual``.
   #   4.0 → 25 cm    2.0 → 50 cm    1.0 → 1 m    0.0 → infinity

@@ -350,6 +350,26 @@ _AF_MODE_NAMES: dict[str, str] = {
     "continuous": "Continuous",
 }
 
+# Autofocus *range* — restricts which focus distances the AF algorithm
+# searches. Strongly affects how reliably the lens locks on close-up
+# text for a magnifier:
+#   normal — ~50 cm to infinity (default; can hunt past the subject)
+#   macro  — ~10 cm to ~50 cm   (best for magnifier use)
+#   full   — entire range       (slowest)
+_AF_RANGE_NAMES: dict[str, str] = {
+    "normal": "Normal",
+    "macro": "Macro",
+    "full": "Full",
+}
+
+# Autofocus *speed* — how aggressively the algorithm refocuses.
+#   normal — gentler, less likely to oscillate
+#   fast   — quicker re-lock when the scene moves
+_AF_SPEED_NAMES: dict[str, str] = {
+    "normal": "Normal",
+    "fast": "Fast",
+}
+
 # cv2 rotation codes for software 90/270 rotation. 180 is achieved
 # in hardware via Transform(hflip=True, vflip=True), so it's not
 # listed here.
@@ -393,6 +413,10 @@ class PiCameraSensor(CameraSensor):
         self._ae_mode = str(pi_cfg.get("ae_mode", "normal")).lower()
         self._hdr_mode = str(pi_cfg.get("hdr", "off")).lower()
         self._af_mode = str(pi_cfg.get("af_mode", "continuous")).lower()
+        # AfRange/AfSpeed only apply when AF is auto or continuous; the
+        # defaults match the libcamera driver defaults.
+        self._af_range = str(pi_cfg.get("af_range", "normal")).lower()
+        self._af_speed = str(pi_cfg.get("af_speed", "normal")).lower()
         # LensPosition is in diopters (1/distance_in_metres). Only
         # used when af_mode == "manual"; ignored otherwise.
         self._lens_position = pi_cfg.get("lens_position")
@@ -451,9 +475,12 @@ class PiCameraSensor(CameraSensor):
         self._picam2 = picam2
         logger.info(
             "PiCameraSensor started: %dx%d format=%s "
-            "awb=%s ae=%s af=%s hdr=%s rotation=%d hflip=%s vflip=%s",
+            "awb=%s ae=%s af=%s af_range=%s af_speed=%s "
+            "hdr=%s rotation=%d hflip=%s vflip=%s",
             self._width, self._height, self._format,
-            self._awb_mode, self._ae_mode, self._af_mode, self._hdr_mode,
+            self._awb_mode, self._ae_mode, self._af_mode,
+            self._af_range, self._af_speed,
+            self._hdr_mode,
             self._rotation, self._hflip, self._vflip,
         )
 
@@ -563,6 +590,23 @@ class PiCameraSensor(CameraSensor):
                 self._af_mode, _AF_MODE_NAMES, "AF",
             )
         )
+        # AfRange + AfSpeed are auxiliary AF controls. They only have
+        # an effect when AfMode is Auto or Continuous; in Manual the
+        # lens is locked and these are ignored. We emit them anyway —
+        # libcamera ignores them cleanly when AF is off.
+        if self._af_mode in ("auto", "continuous"):
+            controls_dict.update(
+                self._resolve_enum_control(
+                    lc_controls, "AfRange", "AfRangeEnum",
+                    self._af_range, _AF_RANGE_NAMES, "AF range",
+                )
+            )
+            controls_dict.update(
+                self._resolve_enum_control(
+                    lc_controls, "AfSpeed", "AfSpeedEnum",
+                    self._af_speed, _AF_SPEED_NAMES, "AF speed",
+                )
+            )
         # Manual focus: lock the lens at a fixed distance. Only
         # emitted when af_mode is "manual" AND lens_position is set.
         if self._af_mode == "manual" and self._lens_position is not None:

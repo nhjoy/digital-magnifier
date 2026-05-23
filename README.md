@@ -3,7 +3,7 @@
 Portable digital magnifier for low-vision children, built on a Raspberry Pi
 Compute Module 5 with the Pi Camera Module 3.
 
-**Current version: MVP 0.2** — real Pi camera input on the CM5.
+**Current version: MVP 0.3** — real GPIO controls via I²C I/O expander.
 
 ## What works
 
@@ -19,12 +19,17 @@ Compute Module 5 with the Pi Camera Module 3.
   are logged but never crash the device
 - Pi Cam 3 continuous autofocus, configurable AWB / AE / HDR / rotation
 - Fullscreen display on the DSI panel
+- **GPIO controls (MVP 0.3)**: navigation switch + 6 buttons via a TCA6416A
+  I²C I/O expander (0x20), keyboard fallback when GPIO isn't available
 
 ## Stubbed (deferred to later MVPs)
 
+- Zoom potentiometer via MCP3221 ADC — driver written, awaiting hardware.
+  ADD1 / ADD2 buttons stand in for ZOOM_IN / ZOOM_OUT until the ADC arrives.
+- RGB status LED — pins are configured as outputs but not yet wired into
+  app logic (MVP 0.4)
 - Gallery UI showing captured images (MVP 0.4)
 - Menu UI (MVP 0.4)
-- Real GPIO buttons + nav switch + ADC pot (MVP 0.3 — currently keyboard mock)
 - Accessibility polish, audio feedback (MVP 0.4)
 - systemd auto-start, watchdog, safe shutdown (MVP 0.5)
 
@@ -77,32 +82,42 @@ sudo apt install -y \
     python3-opencv \
     python3-numpy \
     python3-yaml \
+    python3-smbus2 \
     python3-pytest \
+    i2c-tools \
     git
 
-# 2) Clone (one-time)
+# 2) Enable I²C if you haven't already
+sudo raspi-config nonint do_i2c 0
+
+# 3) Clone (one-time)
 mkdir -p ~/projects && cd ~/projects
 git clone https://github.com/<you>/digital-magnifier.git
 cd digital-magnifier
 
-# 3) Create a venv that can see the apt-installed picamera2
+# 4) Create a venv that can see the apt-installed picamera2 + smbus2
 python3 -m venv venv --system-site-packages
 source venv/bin/activate
 pip install -e ".[dev]"
 
-# 4) Sanity check
+# 5) Sanity check
 pytest tests/ -v
-rpicam-hello --timeout 5000   # confirm the camera hardware is alive
+rpicam-hello --timeout 5000     # confirm the camera hardware is alive
+i2cdetect -y 1                  # confirm 0x20 (TCA6416A) shows up
 
-# 5) Run
+# 6) Run
 digital-magnifier --log-level INFO
 ```
 
 The `--system-site-packages` flag is the important detail — it lets the venv
-see the apt-installed `python3-picamera2` and `python3-libcamera`. Without it
-the app falls back to the mock camera.
+see the apt-installed `python3-picamera2`, `python3-libcamera`, and
+`python3-smbus2`. Without it the app falls back to mock camera and mock
+controls.
 
-After step 3, you only need `source venv/bin/activate` at the start of each
+If the TCA6416A doesn't show up on `i2cdetect`, the app degrades gracefully
+to keyboard mock — useful while you're still wiring the breadboard.
+
+After step 4, you only need `source venv/bin/activate` at the start of each
 session. Add it to `~/.bashrc` if you want it automatic on SSH login.
 
 ## Setup on a development machine (WSL / Linux / macOS, optional)
@@ -120,24 +135,48 @@ digital-magnifier --log-level INFO
 Without picamera2 the app auto-detects this and uses `MockCameraSensor`
 (webcam if available, otherwise a procedurally-generated test frame).
 
-## Keyboard controls
+## Hardware controls (MVP 0.3)
 
-| Key       | Action                          | Notes                  |
-|-----------|---------------------------------|------------------------|
-| `space`   | Freeze / Unfreeze               | Button 1               |
-| `c`       | Capture image                   | Button 2 — saves PNG   |
-| `f`       | Cycle filter                    | Button 3               |
-| `g`       | Open / close gallery (stub)     | Button 4               |
-| `r`       | Reset view                      | Button 5               |
-| `p` / `P` | Power short / long press        | Button 6               |
-| `w/a/s/d` | Pan up/left/down/right          | Nav switch directional |
-| `x`       | Reset view                      | Nav switch centre      |
-| `+` / `=` | Zoom in                         | Pot increase           |
-| `-` / `_` | Zoom out                        | Pot decrease           |
-| `[`       | Back                            | Exit gallery / menu    |
-| `q`       | Quit                            | Dev convenience        |
+The TCA6416A I/O expander at 0x20 hosts the nav switch and six buttons.
+Pin mappings and event bindings live in `config/hardware_pins.yaml`.
 
-In MVP 0.3 these map to real GPIO inputs; the events are identical.
+| Button     | Action                          | Notes                              |
+|------------|---------------------------------|------------------------------------|
+| nav up     | Pan up                          | SKRHABE010 directional (P03)       |
+| nav down   | Pan down                        | P04                                |
+| nav left   | Pan left                        | P00                                |
+| nav right  | Pan right                       | P02                                |
+| nav centre | Reset view                      | P01                                |
+| snapshot   | Capture image                   | P05 — saves timestamped PNG        |
+| album      | Open gallery (stub)             | P06                                |
+| CLR_BTN    | Reset view                      | P07                                |
+| ADD1       | **Zoom in** *(temporary)*       | P10 — moves to FREEZE post-ADC     |
+| ADD2       | **Zoom out** *(temporary)*      | P11 — moves to FILTER_NEXT post-ADC|
+| ADD3       | Power short / long press        | P12 — held 1s = shutdown           |
+
+The MCP3221 ADC at 0x4D will host the zoom potentiometer once wired. Until
+then, ADD1 and ADD2 stand in for ZOOM_IN / ZOOM_OUT. Flip the mapping back
+by editing the `button_events:` block in `config/hardware_pins.yaml`.
+
+## Keyboard fallback (development)
+
+When the TCA6416A isn't present (dev laptop, or breadboard not yet wired),
+the app falls back to keyboard input. Same events, different transport:
+
+| Key       | Action                          |
+|-----------|---------------------------------|
+| `space`   | Freeze / Unfreeze               |
+| `c`       | Capture image                   |
+| `f`       | Cycle filter                    |
+| `g`       | Open / close gallery (stub)     |
+| `r`       | Reset view                      |
+| `p` / `P` | Power short / long press        |
+| `w/a/s/d` | Pan up/left/down/right          |
+| `x`       | Reset view                      |
+| `+` / `=` | Zoom in                         |
+| `-` / `_` | Zoom out                        |
+| `[`       | Back (exit gallery / menu)      |
+| `q`       | Quit (dev convenience)          |
 
 ## Configuration
 

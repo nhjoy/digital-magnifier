@@ -579,7 +579,15 @@ class MagnifierApp:
 
     def _display(self, frame: np.ndarray) -> None:
         if not self._window_opened:
-            cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
+            # WINDOW_GUI_NORMAL suppresses the Qt-enhanced toolbar and
+            # pixel-inspector side panels that OpenCV's Qt backend
+            # (used by python3-opencv on Pi OS) draws by default. Without
+            # this flag, the toolbar and panels appear in the fullscreen
+            # window and partially occlude the camera view.
+            cv2.namedWindow(
+                self.WINDOW_NAME,
+                cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL,
+            )
             if self._fullscreen:
                 cv2.setWindowProperty(
                     self.WINDOW_NAME,

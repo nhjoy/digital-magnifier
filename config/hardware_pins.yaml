@@ -1,81 +1,207 @@
-# ------------------------------------------------------------------
-# Hardware control mapping for the Digital Magnifier
-# ------------------------------------------------------------------
-# Two layers of mappings:
-#   - mock_keyboard_map: development / WSL bindings (key -> AppEvent)
-#   - gpio_pins:         real CM5 hardware (deferred until MVP 0.3)
+# Hardware configuration for the digital magnifier.
 #
-# When swapping mock for real hardware, only the HAL implementation
-# changes; the AppEvent values produced are identical.
+# Three sections, in order:
+#   1. ``hardware`` — platform selection (auto-detected by default).
+#   2. ``i2c`` — bus number plus a catalogue of I2C-connected chips.
+#      Extend ``devices:`` as new chips get added (RTC, additional
+#      ADCs, OLED, etc.). One place to manage all I2C addresses.
+#   3. ``tca6416a_pins`` — pin map + button→event bindings for the
+#      16-bit I/O expander that the nav switch and buttons hang off.
+#   4. ``zoom_pot`` — calibration for the MCP3221 ADC that reads the
+#      zoom potentiometer. Only relevant on real hardware.
+#   5. ``mock_keyboard_map`` — keyboard fallback for desktop dev.
 
+# ===================================================================
+# 1. Platform
+# ===================================================================
 hardware:
-  platform: "auto"   # "auto" | "wsl_mock" | "raspberrypi_cm5"
-                     # "auto" probes for picamera2 at startup and
-                     # picks the right camera HAL — same YAML works
-                     # on WSL (mock) and on the CM5 (Pi camera).
+  # auto      — choose raspberrypi_cm5 if picamera2 imports cleanly,
+  #             else wsl_mock.
+  # wsl_mock  — force MockControls + MockCameraSensor (laptop dev).
+  # raspberrypi_cm5 — force GPIO/I2C path on real CM5 hardware.
+  platform: auto
 
-# ------------------------------------------------------------------
-# Mock keyboard mappings (used by hal/mock_controls.py)
-# ------------------------------------------------------------------
-# key (single character or known alias) -> AppEvent name. The event
-# name must exactly match an entry in
-# digital_magnifier.core.events.AppEvent.
+# ===================================================================
+# 2. I2C bus and devices
+# ===================================================================
+i2c:
+  # CM5 default I2C bus is /dev/i2c-1.
+  bus: 1
+
+  devices:
+    # 16-bit I/O expander: hosts nav switch, 6 buttons, RGB LED.
+    io_expander:
+      chip: tca6416a
+      address: 0x20            # ADDR pin tied to GND
+      int_gpio: null           # INT line not wired to Pi → polling only
+      reset_gpio: null         # RESET pulled up to 3V3, no Pi control
+      poll_interval_ms: 20     # 50 Hz: well above human press rate
+
+    # 12-bit single-channel ADC for the zoom potentiometer.
+    # Sits on the same I2C bus as the I/O expander. The MCP3221 has
+    # NO registers — reads return 2 bytes directly (4 zero bits + 12
+    # data bits). Address depends on the part variant; A5 = 0x4D.
+    #
+    # ``optional: true`` means the rest of the app still runs if the
+    # chip is missing. The zoom-pot control simply does nothing until
+    # the chip is wired in. All other GPIO controls work without it.
+    zoom_adc:
+      chip: mcp3221
+      address: 0x4D            # MCP3221A5T-I/OT (default factory option)
+      optional: true
+      vdd_volts: 3.3
+
+# ===================================================================
+# 3. TCA6416A pin map
+# ===================================================================
+#
+# Direction bytes: 1 = input, 0 = output.
+# Bits are P07..P00 (config_port0) and P17..P10 (config_port1).
+#
+#   Port 0 — all inputs (5 nav + 3 buttons):
+#     P00..P04 = nav switch (active-low buttons via 10k pullup)
+#     P05..P07 = snapshot, album, CLR_BTN
+#     → 0b11111111 = 0xFF
+#
+#   Port 1 — mixed:
+#     P10..P12 = ADD1, ADD2, ADD3 (active-low buttons)
+#     P13..P15 = RGB LED cathodes (common anode to 3V3, sink to light)
+#     P16, P17 = unused (configured as inputs, ignored)
+#     bits 0..2 = inputs (1), bits 3..5 = outputs (0), bits 6..7 = inputs (1)
+#     → 0b11000111 = 0xC7
+#
+tca6416a_pins:
+  config_port0: 0xFF           # all inputs
+  config_port1: 0xC7           # 3 inputs + 3 LED outputs + 2 unused
+
+  # Input pin map. Names here flow through to button_events below.
+  # All inputs are active-low (button pressed = pin reads 0).
+  inputs:
+    nav_left:   P00            # nav switch A
+    nav_center: P01
+    nav_right:  P02            # nav switch C
+    nav_up:     P03            # nav switch B
+    nav_down:   P04            # nav switch D
+    snapshot:   P05
+    album:      P06
+    clr_btn:    P07
+    add1:       P10
+    add2:       P11
+    add3:       P12
+
+  # Output pin map. RGB status LED is common-anode to 3V3:
+  # driving an output LOW lights that colour, HIGH turns it off.
+  # Defined here for future use — MVP 0.3 leaves them all off.
+  outputs:
+    led_blue:   P13
+    led_green:  P14
+    led_red:    P15
+
+# ===================================================================
+# 4. Button → AppEvent bindings
+# ===================================================================
+#
+# Each input name above can be bound to an AppEvent. Press detection
+# is edge-based: the event fires on the falling edge (button press),
+# not while the button is held. Nav directions can optionally repeat
+# while held — see ``nav_repeat`` below.
+#
+# Current mapping (MVP 0.3 — no MCP3221 yet):
+#   ADD1 and ADD2 are temporarily used for zoom in/out because the
+#   pot wiper goes through a digital GPIO and cannot produce
+#   meaningful analogue readings. CLR_BTN cycles the vision filter
+#   (was RESET_VIEW; the nav switch centre press now does reset).
+#   Once the MCP3221 is wired:
+#     - move zoom to the pot
+#     - put FREEZE_TOGGLE back on ADD1
+#     - put RESET_VIEW back on CLR_BTN if you prefer button reset
+#   See the commented "post-ADC" block below.
+#
+button_events:
+  snapshot:    CAPTURE_IMAGE
+  album:       GALLERY_OPEN
+  clr_btn:     FILTER_NEXT      # was RESET_VIEW (now lives on nav centre)
+  add1:        ZOOM_IN          # temporary — post-ADC moves to FREEZE_TOGGLE
+  add2:        ZOOM_OUT         # temporary — post-ADC moves to FILTER_NEXT
+  # add3 → power button, handled specially (short vs long press).
+
+# Once the MCP3221 is in the circuit, swap to this mapping by
+# commenting out the block above and uncommenting this one:
+#
+# button_events:
+#   snapshot:    CAPTURE_IMAGE
+#   album:       GALLERY_OPEN
+#   clr_btn:     RESET_VIEW
+#   add1:        FREEZE_TOGGLE
+#   add2:        FILTER_NEXT
+
+# Nav switch — directional pad. Centre press doubles as "reset view".
+nav_events:
+  nav_up:      PAN_UP
+  nav_down:    PAN_DOWN
+  nav_left:    PAN_LEFT
+  nav_right:   PAN_RIGHT
+  nav_center:  RESET_VIEW
+
+# Optional repeat-while-held for nav directions. Keyboards do this
+# at the OS level; GPIO has to do it in software. Tuned for "press
+# and hold to pan further across a page".
+nav_repeat:
+  enabled: true
+  initial_delay_ms: 400        # wait this long before first repeat
+  interval_ms: 100             # then emit one repeat every interval
+
+# Power button (mapped to ``add3`` above). Press shorter than the
+# threshold = POWER_SHORT_PRESS (opens menu). Press held longer than
+# the threshold = POWER_LONG_PRESS (clean shutdown). The long event
+# fires the moment the threshold is crossed, not on release, so the
+# user gets immediate feedback when they hold for shutdown.
+power_button:
+  input: add3
+  long_press_threshold_ms: 1000
+
+# ===================================================================
+# 5. Zoom potentiometer calibration (MCP3221 path)
+# ===================================================================
+#
+# The MCP3221 returns a raw 12-bit value (0–4095). We quantise that
+# into N discrete zoom buckets and emit ZOOM_IN / ZOOM_OUT events
+# when the user turns the knob across a bucket boundary.
+#
+# ``buckets`` controls coarseness. With 16 buckets, each ~206 raw
+# counts wide, the pot needs to turn ~1/16th of its arc before an
+# event fires. Increase for finer control, decrease if you see jitter.
+
+zoom_pot:
+  buckets: 16
+  # Invert if turning right zooms out instead of in. Easier to flip
+  # here than to re-solder the pot.
+  invert: false
+  # Below this many consecutive stable reads at a new bucket, do
+  # not emit anything. Cheap software debounce on top of the 100nF
+  # hardware filter (C6).
+  debounce_reads: 2
+
+# ===================================================================
+# 6. Keyboard fallback (development without GPIO)
+# ===================================================================
+
 mock_keyboard_map:
-
-  # --- the six push buttons ------------------------------------
-  "space": FREEZE_TOGGLE        # button 1 (largest / most-used)
-  "c":     CAPTURE_IMAGE        # button 2
-  "f":     FILTER_NEXT          # button 3
-  "g":     GALLERY_OPEN         # button 4 (stub UI in MVP 0.1)
-  "r":     RESET_VIEW           # button 5 (zoom=1, pan=0, filter=normal)
-  "p":     POWER_SHORT_PRESS    # button 6 short press: toggle menu
-  "P":     POWER_LONG_PRESS     # button 6 long press: shutdown
-                                # (uses shift+p because cv2.waitKey
-                                # cannot reliably distinguish
-                                # short vs hold on a keyboard)
-
-  # --- navigation switch (4-way directional + centre press) -----
-  "w":     PAN_UP
-  "s":     PAN_DOWN
-  "a":     PAN_LEFT
-  "d":     PAN_RIGHT
-  "x":     RESET_VIEW           # nav-centre press shares the
-                                # reset event with button 5
-
-  # --- zoom potentiometer (mock = discrete step events) ---------
-  "+":     ZOOM_IN
-  "=":     ZOOM_IN              # same physical key as + without shift
-  "-":     ZOOM_OUT
-  "_":     ZOOM_OUT             # same physical key as - with shift
-
-  # --- mode navigation helpers ----------------------------------
-  "[":     BACK                 # explicit back/exit in gallery or menu
-
-  # --- developer convenience ------------------------------------
-  "q":     QUIT                 # clean exit during development;
-                                # bypasses power-button code path
-
-# ------------------------------------------------------------------
-# GPIO pin assignments (used by future GPIOControls HAL in MVP 0.3)
-# ------------------------------------------------------------------
-# Pin numbers are BCM. The TCA9535 expander is used if more pins are
-# needed than the CM5 exposes directly. These are placeholders;
-# adjust during MVP 0.3 to match the actual breadboard wiring.
-gpio_pins:
-  buttons:
-    freeze:      17
-    capture:     27
-    filter_next: 22
-    gallery:     23
-    reset_view:  24
-    power:       25
-  joystick:
-    up:     5
-    down:   6
-    left:   13
-    right:  19
-    centre: 26
-  zoom_potentiometer:
-    adc_channel: 0
-  power_button:
-    long_press_threshold_ms: 1000
+  " ": FREEZE_TOGGLE
+  c:   CAPTURE_IMAGE
+  f:   FILTER_NEXT
+  g:   GALLERY_OPEN
+  r:   RESET_VIEW
+  p:   POWER_SHORT_PRESS
+  P:   POWER_LONG_PRESS
+  w:   PAN_UP
+  a:   PAN_LEFT
+  s:   PAN_DOWN
+  d:   PAN_RIGHT
+  x:   RESET_VIEW
+  "+": ZOOM_IN
+  "=": ZOOM_IN
+  "-": ZOOM_OUT
+  _:   ZOOM_OUT
+  "[": BACK
+  q:   QUIT

@@ -236,11 +236,22 @@ def _make_fake_libcamera_module() -> SimpleNamespace:
         Auto="af_auto",
         Continuous="af_continuous",
     )
+    AfRangeEnum = SimpleNamespace(
+        Normal="afr_normal",
+        Macro="afr_macro",
+        Full="afr_full",
+    )
+    AfSpeedEnum = SimpleNamespace(
+        Normal="afs_normal",
+        Fast="afs_fast",
+    )
     controls = SimpleNamespace(
         AwbModeEnum=AwbModeEnum,
         AeExposureModeEnum=AeExposureModeEnum,
         HdrModeEnum=HdrModeEnum,
         AfModeEnum=AfModeEnum,
+        AfRangeEnum=AfRangeEnum,
+        AfSpeedEnum=AfSpeedEnum,
     )
 
     def Transform(hflip: bool = False, vflip: bool = False):
@@ -450,6 +461,54 @@ class TestPiStart:
         )
         assert "AfMode" not in controls
         assert any("AF mode" in r.message for r in caplog.records)
+
+    def test_af_range_macro_passed_through(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        pi_config["pi_camera"]["af_mode"] = "continuous"
+        pi_config["pi_camera"]["af_range"] = "macro"
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        controls = fake_picam2.create_video_configuration.call_args.kwargs["controls"]
+        assert controls["AfRange"] == "afr_macro"
+
+    def test_af_speed_fast_passed_through(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        pi_config["pi_camera"]["af_mode"] = "continuous"
+        pi_config["pi_camera"]["af_speed"] = "fast"
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        controls = fake_picam2.create_video_configuration.call_args.kwargs["controls"]
+        assert controls["AfSpeed"] == "afs_fast"
+
+    def test_af_range_and_speed_skipped_when_manual(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module, fake_picam2
+    ):
+        # In manual mode the lens is locked and these controls have no
+        # effect, so the driver shouldn't see them.
+        pi_config["pi_camera"]["af_mode"] = "manual"
+        pi_config["pi_camera"]["lens_position"] = 4.0
+        pi_config["pi_camera"]["af_range"] = "macro"
+        pi_config["pi_camera"]["af_speed"] = "fast"
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        sensor.start()
+        controls = fake_picam2.create_video_configuration.call_args.kwargs["controls"]
+        assert "AfRange" not in controls
+        assert "AfSpeed" not in controls
+
+    def test_unknown_af_range_logs_and_skips(
+        self, pi_config, fake_picamera2_module, fake_libcamera_module,
+        fake_picam2, caplog,
+    ):
+        pi_config["pi_camera"]["af_mode"] = "continuous"
+        pi_config["pi_camera"]["af_range"] = "supermacro"
+        sensor = _make_pi_sensor(pi_config, fake_picamera2_module, fake_libcamera_module)
+        with caplog.at_level("WARNING"):
+            sensor.start()
+        controls = fake_picam2.create_video_configuration.call_args.kwargs["controls"]
+        assert "AfRange" not in controls
+        assert any("AF range" in r.message for r in caplog.records)
 
 
 class TestPiStop:

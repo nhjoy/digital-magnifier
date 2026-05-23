@@ -28,7 +28,7 @@ magnifier:
   # Step per ZOOM_IN / ZOOM_OUT event. With keyboard mock, every
   # press is one step; with real pot in MVP 0.3, steps are
   # generated as the pot crosses thresholds.
-  zoom_step: 0.5
+  zoom_step: 0.1
   default_zoom: 1.0
   # Pan offset (normalised, -1..+1) per nav-switch event.
   pan_step: 0.1

@@ -156,6 +156,112 @@ def _build_camera(
     return MockCameraSensor(camera_config)
 
 
+def _build_controls(
+    platform: str,
+    hardware_config: dict[str, Any],
+):  # -> ControlsHAL  (annotation omitted to avoid eager import)
+    """Construct the appropriate ControlsHAL for the platform.
+
+    On the CM5, attempt to open the I2C bus and probe the TCA6416A.
+    If that succeeds, use :class:`GPIOControls` (with the MCP3221
+    ADC if it also probes successfully — the zoom pot is optional
+    so a missing ADC degrades gracefully to "zoom pot does nothing").
+    If anything in the GPIO path fails (smbus2 missing, I2C disabled,
+    chip not wired), fall back to :class:`MockControls` so the
+    keyboard can still drive the device for debugging.
+    """
+    if platform == PLATFORM_AUTO:
+        platform = _detect_platform_auto()
+
+    if platform != PLATFORM_RPI_CM5:
+        logger.info("Controls: MockControls (keyboard)")
+        return MockControls(hardware_config)
+
+    # CM5 path: try to bring up GPIOControls.
+    try:
+        from digital_magnifier.hal.i2c_devices import (
+            I2CError,
+            MCP3221,
+            TCA6416A,
+            open_smbus_bus,
+            parse_address,
+        )
+        from digital_magnifier.hal.mock_controls import GPIOControls
+    except ImportError as exc:
+        logger.warning(
+            "GPIO dependencies missing (%s); falling back to MockControls", exc,
+        )
+        return MockControls(hardware_config)
+
+    i2c_cfg = hardware_config.get("i2c", {})
+    bus_number = int(i2c_cfg.get("bus", 1))
+    devices_cfg = i2c_cfg.get("devices", {})
+    io_cfg = devices_cfg.get("io_expander", {})
+    adc_cfg = devices_cfg.get("zoom_adc", {})
+
+    # Open the bus
+    try:
+        bus = open_smbus_bus(bus_number)
+    except I2CError as exc:
+        logger.warning(
+            "Cannot open I2C bus %d (%s); falling back to MockControls",
+            bus_number, exc,
+        )
+        return MockControls(hardware_config)
+
+    # Build TCA6416A
+    try:
+        io_expander = TCA6416A(
+            bus,
+            address=parse_address(io_cfg.get("address", 0x20)),
+            config_port0=int(
+                hardware_config.get("tca6416a_pins", {}).get("config_port0", 0xFF)
+            ),
+            config_port1=int(
+                hardware_config.get("tca6416a_pins", {}).get("config_port1", 0xFF)
+            ),
+        )
+        io_expander.probe()
+    except (I2CError, ValueError) as exc:
+        logger.warning(
+            "TCA6416A not detected (%s); falling back to MockControls", exc,
+        )
+        bus.close()
+        return MockControls(hardware_config)
+
+    # Build MCP3221 (optional)
+    adc: MCP3221 | None = None
+    if adc_cfg:
+        try:
+            adc = MCP3221(
+                bus,
+                address=parse_address(adc_cfg.get("address", 0x4D)),
+                vdd_volts=float(adc_cfg.get("vdd_volts", 3.3)),
+            )
+            adc.probe()
+        except (I2CError, ValueError) as exc:
+            optional = bool(adc_cfg.get("optional", True))
+            if optional:
+                logger.info(
+                    "MCP3221 not present (%s); zoom pot disabled "
+                    "(this is fine until you wire it in)",
+                    exc,
+                )
+                adc = None
+            else:
+                logger.error(
+                    "MCP3221 not present and configured as required (%s); "
+                    "falling back to MockControls",
+                    exc,
+                )
+                bus.close()
+                return MockControls(hardware_config)
+
+    logger.info("Controls: GPIOControls (TCA6416A + %s)",
+                "MCP3221" if adc else "no ADC")
+    return GPIOControls(hardware_config, io_expander, adc)
+
+
 def _build_app_config(
     app_cfg: dict[str, Any],
     camera_cfg: dict[str, Any],
@@ -195,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         log_cfg["level"] = args.log_level
     setup_logging(log_cfg)
 
-    logger.info("Digital Magnifier starting (v0.2)")
+    logger.info("Digital Magnifier starting (v0.3)")
     if args.config_dir:
         logger.info("using config dir: %s", args.config_dir)
 
@@ -205,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("resolved platform: %s", platform)
 
         camera = _build_camera(platform, configs["camera"])
-        controls = MockControls(configs["hardware_pins"])
+        controls = _build_controls(platform, configs["hardware_pins"])
 
         capture_cfg = configs["app"].get("capture", {})
         saver = ImageSaver(
