@@ -262,6 +262,77 @@ def _build_controls(
     return GPIOControls(hardware_config, io_expander, adc)
 
 
+def _probe_ups(hardware_config: dict) -> Any:
+    """Try to connect to a Waveshare UPS HAT (E) on I²C.
+
+    Returns a ``UPSHatE`` instance if the HAT is present, or
+    ``None`` if it can't be reached. Does not raise — the UPS is
+    an optional accessory for battery-percentage display.
+    """
+    try:
+        from digital_magnifier.hal.i2c_devices import (
+            I2CError,
+            UPSHatE,
+            open_smbus_bus,
+            parse_address,
+        )
+    except ImportError:
+        return None
+
+    i2c_cfg = hardware_config.get("i2c", {})
+    bus_number = int(i2c_cfg.get("bus", 1))
+    devices_cfg = i2c_cfg.get("devices", {})
+    ups_cfg = devices_cfg.get("ups_hat", {})
+    address = parse_address(ups_cfg.get("address", 0x2D))
+
+    try:
+        bus = open_smbus_bus(bus_number)
+    except I2CError:
+        return None
+
+    try:
+        ups = UPSHatE(bus, address=address)
+        ups.probe()
+        pct = ups.battery_percent()
+        logger.info(
+            "UPS HAT (E) at 0x%02x: detected (battery %d%%)",
+            address, pct,
+        )
+        return ups
+    except (I2CError, ValueError) as exc:
+        logger.info(
+            "UPS HAT not detected at 0x%02x (%s); battery display disabled",
+            address, exc,
+        )
+        bus.close()
+        return None
+
+
+def _probe_buzzer(hardware_config: dict) -> Any:
+    """Try to open the buzzer on the configured GPIO pin.
+
+    Returns a ``BuzzerController`` instance if the pin was claimed,
+    or ``None`` if gpiozero is missing or the pin can't be opened.
+    """
+    buzzer_cfg = hardware_config.get("buzzer", {})
+    if not buzzer_cfg.get("enabled", True):
+        logger.info("Buzzer disabled in config")
+        return None
+
+    pin = int(buzzer_cfg.get("pin", 24))
+    freq = int(buzzer_cfg.get("frequency_hz", 4000))
+
+    try:
+        from digital_magnifier.hal.buzzer import BuzzerController
+        buz = BuzzerController(pin=pin, frequency=freq)
+        if buz.available:
+            return buz
+        return None
+    except Exception as exc:
+        logger.info("Buzzer not available: %s", exc)
+        return None
+
+
 def _build_app_config(
     app_cfg: dict[str, Any],
     camera_cfg: dict[str, Any],
@@ -324,11 +395,20 @@ def main(argv: list[str] | None = None) -> int:
         app_config = _build_app_config(
             configs["app"], configs["camera"]
         )
+
+        # Probe UPS HAT (optional — battery display disabled if absent)
+        ups = _probe_ups(configs["hardware_pins"])
+
+        # Probe buzzer (optional — audio feedback disabled if absent)
+        buzzer = _probe_buzzer(configs["hardware_pins"])
+
         app = MagnifierApp(
             camera=camera,
             controls=controls,
             image_saver=saver,
             config=app_config,
+            ups=ups,
+            buzzer=buzzer,
         )
     except Exception:
         logger.exception("failed to construct application")

@@ -118,12 +118,21 @@ tca6416a_pins:
 #   See the commented "post-ADC" block below.
 #
 button_events:
-  snapshot:    CAPTURE_IMAGE
   album:       GALLERY_OPEN
   clr_btn:     FILTER_NEXT      # was RESET_VIEW (now lives on nav centre)
   add1:        ZOOM_IN          # temporary — post-ADC moves to FREEZE_TOGGLE
   add2:        ZOOM_OUT         # temporary — post-ADC moves to FILTER_NEXT
   # add3 → power button, handled specially (short vs long press).
+  # snapshot → snapshot button, handled specially (tap vs hold).
+
+# Snapshot button: tap/release = freeze/unfreeze, hold 3 seconds = capture.
+# This gives a single physical button dual-function — the child can
+# quickly freeze text with a tap, then take a real snapshot by holding.
+snapshot_button:
+  input: snapshot
+  short_event: FREEZE_TOGGLE
+  long_event: CAPTURE_IMAGE
+  long_press_threshold_ms: 3000
 
 # Once the MCP3221 is in the circuit, swap to this mapping by
 # commenting out the block above and uncommenting this one:
@@ -205,3 +214,16 @@ mock_keyboard_map:
   _:   ZOOM_OUT
   "[": BACK
   q:   QUIT
+
+# ===================================================================
+# 8. Buzzer (PS1740P02E passive piezo transducer)
+# ===================================================================
+#
+# The PS1740P02E is a passive transducer — it needs a square wave at
+# its resonant frequency (4 kHz) to produce sound. Set enabled: false
+# to suppress all audio feedback.
+
+buzzer:
+  enabled: true
+  pin: 24                      # BCM pin (physical pin 18)
+  frequency_hz: 4000           # resonant frequency of the transducer

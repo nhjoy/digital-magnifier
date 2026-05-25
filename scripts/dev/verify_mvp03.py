@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys
 import unittest
 
-sys.path.insert(0, "src")
+sys.path.insert(0, str((__import__("pathlib").Path(__file__).resolve().parents[2] / "src")))
 
 from digital_magnifier.core.events import AppEvent
 from digital_magnifier.hal.i2c_devices import (

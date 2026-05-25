@@ -94,3 +94,104 @@ class ImageSaver:
 
         logger.info("saved capture to %s", path)
         return path
+
+    # ------------------------------------------------------------------
+    # Gallery support (MVP 0.4)
+    # ------------------------------------------------------------------
+
+    # File extensions the gallery is willing to load. Kept small on
+    # purpose — the saver only writes PNG by default, so anything
+    # else in the directory is probably a stray file that should not
+    # appear in the browse list.
+    _IMAGE_EXTENSIONS: frozenset[str] = frozenset({".png", ".jpg", ".jpeg"})
+
+    def list_images(self, newest_first: bool = True) -> list[Path]:
+        """Return all image files in the output directory.
+
+        Filters by extension (PNG / JPG) so stray text files or
+        thumbnails don't show up. Sorted by filesystem modification
+        time so the order is meaningful even if files were copied in
+        manually (rather than relying on the ``capture_YYYYMMDD…``
+        filename pattern, which would miss user-imported images).
+
+        Parameters
+        ----------
+        newest_first : bool
+            True (default) — most recently modified file first.
+            False — oldest first.
+
+        Returns
+        -------
+        list[Path]
+            Absolute paths to image files. Empty list if the directory
+            is missing, empty, or has no images. Never raises for the
+            "no captures yet" case — that's a legitimate state.
+        """
+        if not self._dir.exists():
+            return []
+
+        images: list[Path] = []
+        try:
+            for entry in self._dir.iterdir():
+                if not entry.is_file():
+                    continue
+                if entry.suffix.lower() not in self._IMAGE_EXTENSIONS:
+                    continue
+                images.append(entry)
+        except OSError:
+            # Permission denied, disappeared mid-scan, etc. Treat as empty.
+            logger.exception("could not scan %s", self._dir)
+            return []
+
+        # Sort by mtime so user-imported files appear in their natural
+        # order, not interleaved by filename.
+        try:
+            images.sort(key=lambda p: p.stat().st_mtime, reverse=newest_first)
+        except OSError:
+            # A file vanished between iterdir and stat. Fall back to
+            # whatever order we have.
+            logger.exception("stat failed while sorting captures")
+
+        return images
+
+    def delete_image(self, path: Path) -> None:
+        """Remove an image file from the output directory.
+
+        Refuses to delete anything outside the configured directory —
+        a tiny but important safety check, since the gallery passes
+        whatever path it has and we don't want a path-traversal bug
+        to wipe a user's home directory.
+
+        Parameters
+        ----------
+        path : Path
+            File to remove. Must be inside :attr:`output_directory`.
+
+        Raises
+        ------
+        ImageSaverError
+            If the path is outside the output directory, or the
+            underlying ``unlink`` failed.
+        """
+        target = Path(path).resolve()
+
+        # Containment check: target must be a descendant of our
+        # output directory. ``relative_to`` raises if it isn't.
+        try:
+            target.relative_to(self._dir)
+        except ValueError as exc:
+            raise ImageSaverError(
+                f"refusing to delete {target}: not inside output "
+                f"directory {self._dir}"
+            ) from exc
+
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            # Already gone — treat as success; the caller's mental
+            # model ("this image no longer exists") is satisfied.
+            logger.warning("delete_image: %s already gone", target)
+        except OSError as exc:
+            raise ImageSaverError(f"could not delete {target}: {exc}") from exc
+        else:
+            logger.info("deleted capture %s", target)

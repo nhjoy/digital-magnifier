@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, "src")
+sys.path.insert(0, str((__import__("pathlib").Path(__file__).resolve().parents[2] / "src")))
 
 import cv2  # for image I/O in the fallback test
 

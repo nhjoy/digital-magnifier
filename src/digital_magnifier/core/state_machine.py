@@ -154,13 +154,22 @@ IN_STATE_EVENTS: dict[AppState, frozenset[AppEvent]] = {
     # default) that no useful interaction is missed.
     AppState.CAPTURE_FLASH: frozenset(),
 
-    # Stub set for MVP 0.1. Gallery browsing is wired up in MVP 0.4;
-    # for now the nav switch left/right do nothing meaningful, but
-    # they are accepted (not warned about) so the placeholder screen
-    # feels responsive rather than broken.
+    # Gallery interaction (MVP 0.4). Same six view-manipulation
+    # events as live/frozen, plus CAPTURE_IMAGE which the gallery
+    # repurposes as "delete with confirmation" (snapshot button has
+    # no other useful meaning in gallery view). The app controller
+    # delegates these to the Gallery instance, which owns its own
+    # zoom / pan / filter state separate from the live view.
     AppState.GALLERY_VIEW: frozenset({
+        AppEvent.ZOOM_IN,
+        AppEvent.ZOOM_OUT,
+        AppEvent.PAN_UP,
+        AppEvent.PAN_DOWN,
         AppEvent.PAN_LEFT,
         AppEvent.PAN_RIGHT,
+        AppEvent.FILTER_NEXT,
+        AppEvent.RESET_VIEW,
+        AppEvent.CAPTURE_IMAGE,
     }),
 
     # Same idea for the menu stub.

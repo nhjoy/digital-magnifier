@@ -430,6 +430,281 @@ class MCP3221:
 
 
 # ===================================================================
+# UPS HAT (E) — Waveshare battery management board
+# ===================================================================
+
+
+from dataclasses import dataclass, field
+
+
+# Charge-state code → human-readable label, per the datasheet
+# (Charging Register, bits 2:0).
+_CHARGE_STATE_NAMES: dict[int, str] = {
+    0b000: "standby",
+    0b001: "trickle",
+    0b010: "constant_current",
+    0b011: "constant_voltage",
+    0b100: "pending",
+    0b101: "full",
+    0b110: "timeout",
+}
+
+
+@dataclass
+class UPSStatus:
+    """A complete snapshot of the UPS HAT's state.
+
+    Returned by :meth:`UPSHatE.read_summary`. Everything is in SI
+    units — millivolts, milliamps, milliwatts, minutes, percent —
+    matching the register definitions verbatim. Convert at the
+    presentation layer if you want volts.
+    """
+
+    # --- top-level status bits ----------------------------------
+    charging: bool                    # actively pulling charge from VBUS
+    fast_charging: bool               # in fast-charge mode
+    vbus_powered: bool                # external supply connected
+    charge_state: str                 # one of the _CHARGE_STATE_NAMES values
+
+    # --- VBUS ---------------------------------------------------
+    vbus_voltage_mv: int
+    vbus_current_ma: int
+    vbus_power_mw: int
+
+    # --- battery ------------------------------------------------
+    battery_voltage_mv: int
+    battery_current_ma: int           # SIGNED: +ve charging, -ve discharging
+    battery_percent: int              # 0..100
+    battery_remaining_capacity_mah: int
+    remaining_discharge_min: int
+    remaining_charge_min: int
+
+    # --- per-cell ----------------------------------------------
+    cell_voltages_mv: tuple[int, int, int, int] = field(
+        default=(0, 0, 0, 0)
+    )
+
+
+class UPSHatE:
+    """Driver for the Waveshare UPS HAT (E).
+
+    Per the manufacturer's wiki, the board exposes a register-style
+    I²C interface at address 0x2D. Single-byte reads from each
+    register; 16-bit values are split across two consecutive
+    registers, little-endian (low byte at the lower address).
+
+    The battery-current register at 0x22/0x23 is *signed* 16-bit —
+    positive means charging into the pack, negative means the pack
+    is supplying the load. All other 16-bit values are unsigned.
+
+    Parameters
+    ----------
+    bus
+        Anything matching :class:`I2CBusLike`.
+    address
+        7-bit I²C address. Default 0x2D matches the factory
+        Waveshare board; user-configurable via the device's own
+        register 0x41 (we don't write to that here).
+    """
+
+    # --- register addresses (from the Waveshare register table) -
+    REG_ID = 0x00                     # fixed 0x0A
+    REG_REBOOT = 0x01                 # fixed read 0x0B, write 0x55 to power-cycle
+    REG_CHARGE_STATUS = 0x02
+    REG_COMM_STATUS = 0x03
+
+    REG_VBUS_VOLTAGE = 0x10           # 0x10/0x11 (mV)
+    REG_VBUS_CURRENT = 0x12           # 0x12/0x13 (mA)
+    REG_VBUS_POWER = 0x14             # 0x14/0x15 (mW)
+
+    REG_BATT_VOLTAGE = 0x20           # 0x20/0x21 (mV)
+    REG_BATT_CURRENT = 0x22           # 0x22/0x23 (mA, SIGNED)
+    REG_BATT_PERCENT = 0x24           # 0x24/0x25 (%)
+    REG_BATT_REMAIN_CAPACITY = 0x26   # 0x26/0x27 (mAh)
+    REG_BATT_DISCHARGE_MIN = 0x28     # 0x28/0x29 (min)
+    REG_BATT_CHARGE_MIN = 0x2A        # 0x2A/0x2B (min)
+
+    REG_CELL_BASE = 0x30              # 0x30..0x37, four cells × 2 bytes
+
+    REG_CONTROL = 0x40                # watchdog enable + auto-restart bits
+    REG_ADDRESS = 0x41                # configurable I²C address (0x08..0x77)
+    REG_WATCHDOG_TIMEOUT_S = 0x42     # 0..255 seconds
+    REG_WATCHDOG_DELAY_S = 0x43       # 0..255 seconds
+    REG_SW_REVISION = 0x50            # e.g. 0x14 == V2.0
+
+    EXPECTED_ID = 0x0A
+    DEFAULT_ADDRESS = 0x2D
+    POWER_OFF_MAGIC = 0x55            # write to REG_REBOOT to power down
+
+    def __init__(
+        self,
+        bus: I2CBusLike,
+        address: int = DEFAULT_ADDRESS,
+    ) -> None:
+        if not (0x00 <= address <= 0x7F):
+            raise ValueError(f"I2C address out of range: 0x{address:02x}")
+        self._bus = bus
+        self._address = address
+
+    # ----- low-level helpers -----------------------------------
+
+    def _read8(self, register: int) -> int:
+        return self._bus.read_byte_data(self._address, register) & 0xFF
+
+    def _read16(self, register: int) -> int:
+        """Read 16-bit unsigned value at consecutive registers (LE)."""
+        low = self._bus.read_byte_data(self._address, register) & 0xFF
+        high = self._bus.read_byte_data(self._address, register + 1) & 0xFF
+        return (high << 8) | low
+
+    def _read16_signed(self, register: int) -> int:
+        """Read 16-bit two's-complement signed value at consecutive registers."""
+        value = self._read16(register)
+        if value & 0x8000:
+            value -= 0x10000
+        return value
+
+    # ----- presence ---------------------------------------------
+
+    def probe(self) -> None:
+        """Confirm the chip responds and reports the expected ID byte.
+
+        Raises :class:`I2CError` on any bus failure, or if the ID
+        register doesn't read back as ``0x0A`` (the manufacturer's
+        fixed signature). The ID check protects against confusion
+        if some other chip happens to live at 0x2D.
+        """
+        try:
+            ident = self._read8(self.REG_ID)
+        except I2CError:
+            raise
+        if ident != self.EXPECTED_ID:
+            raise I2CError(
+                f"UPS HAT at 0x{self._address:02x} ID register reads "
+                f"0x{ident:02x}, expected 0x{self.EXPECTED_ID:02x}; "
+                f"is something else on this address?"
+            )
+
+    # ----- individual readers -----------------------------------
+
+    def battery_percent(self) -> int:
+        """Battery state of charge, 0..100 (percent)."""
+        return self._read16(self.REG_BATT_PERCENT)
+
+    def battery_voltage_mv(self) -> int:
+        """Battery pack total voltage in millivolts."""
+        return self._read16(self.REG_BATT_VOLTAGE)
+
+    def battery_current_ma(self) -> int:
+        """Battery current in mA. Positive = charging in; negative = supplying load."""
+        return self._read16_signed(self.REG_BATT_CURRENT)
+
+    def battery_remaining_capacity_mah(self) -> int:
+        """Remaining capacity in mAh as reported by the fuel gauge."""
+        return self._read16(self.REG_BATT_REMAIN_CAPACITY)
+
+    def remaining_discharge_min(self) -> int:
+        """Estimated minutes of runtime left at current load."""
+        return self._read16(self.REG_BATT_DISCHARGE_MIN)
+
+    def remaining_charge_min(self) -> int:
+        """Estimated minutes left until full (only meaningful while charging)."""
+        return self._read16(self.REG_BATT_CHARGE_MIN)
+
+    def vbus_voltage_mv(self) -> int:
+        """External supply voltage at the USB-C input (mV)."""
+        return self._read16(self.REG_VBUS_VOLTAGE)
+
+    def vbus_current_ma(self) -> int:
+        """Current drawn from the external supply (mA, unsigned)."""
+        return self._read16(self.REG_VBUS_CURRENT)
+
+    def vbus_power_mw(self) -> int:
+        """Power drawn from the external supply (mW)."""
+        return self._read16(self.REG_VBUS_POWER)
+
+    def cell_voltage_mv(self, cell: int) -> int:
+        """Voltage of cell ``cell`` (1..4) in millivolts.
+
+        Cells 2..4 read as 0 on a 1S pack; readings only matter on
+        the 2S/3S/4S variants of the HAT.
+        """
+        if not (1 <= cell <= 4):
+            raise ValueError(f"cell index must be 1..4, got {cell}")
+        return self._read16(self.REG_CELL_BASE + (cell - 1) * 2)
+
+    def charging_status(self) -> dict[str, object]:
+        """Decode the charge status register (0x02) into a dict.
+
+        Keys: ``charging`` (bool), ``fast_charging`` (bool),
+        ``vbus_powered`` (bool), ``charge_state`` (str, one of
+        ``standby`` / ``trickle`` / ``constant_current`` /
+        ``constant_voltage`` / ``pending`` / ``full`` / ``timeout`` /
+        ``unknown``).
+        """
+        byte = self._read8(self.REG_CHARGE_STATUS)
+        state_bits = byte & 0b111
+        return {
+            "charging":      bool(byte & 0b1000_0000),
+            "fast_charging": bool(byte & 0b0100_0000),
+            "vbus_powered":  bool(byte & 0b0010_0000),
+            "charge_state":  _CHARGE_STATE_NAMES.get(state_bits, "unknown"),
+        }
+
+    # ----- one-shot summary -------------------------------------
+
+    def read_summary(self) -> UPSStatus:
+        """Read everything in one go and return a :class:`UPSStatus`.
+
+        This is the convenience entry point most callers want. Costs
+        ~25 register reads but at 400 kHz I²C that's a few ms — fine
+        to call once per second.
+        """
+        status = self.charging_status()
+        return UPSStatus(
+            charging=bool(status["charging"]),
+            fast_charging=bool(status["fast_charging"]),
+            vbus_powered=bool(status["vbus_powered"]),
+            charge_state=str(status["charge_state"]),
+
+            vbus_voltage_mv=self.vbus_voltage_mv(),
+            vbus_current_ma=self.vbus_current_ma(),
+            vbus_power_mw=self.vbus_power_mw(),
+
+            battery_voltage_mv=self.battery_voltage_mv(),
+            battery_current_ma=self.battery_current_ma(),
+            battery_percent=self.battery_percent(),
+            battery_remaining_capacity_mah=self.battery_remaining_capacity_mah(),
+            remaining_discharge_min=self.remaining_discharge_min(),
+            remaining_charge_min=self.remaining_charge_min(),
+
+            cell_voltages_mv=(
+                self.cell_voltage_mv(1),
+                self.cell_voltage_mv(2),
+                self.cell_voltage_mv(3),
+                self.cell_voltage_mv(4),
+            ),
+        )
+
+    # ----- power control ---------------------------------------
+
+    def request_power_off(self) -> None:
+        """Tell the UPS to cut power to the Pi after a graceful delay.
+
+        Writes ``0x55`` to register 0x01 (the manufacturer's
+        documented "power off and enable the incoming power
+        function" command). The HAT will then power-cycle once
+        external power returns. Used during clean shutdown.
+
+        This is *destructive* — calling it kills the Pi shortly
+        after. Be sure to sync filesystems first.
+        """
+        self._bus.write_byte_data(
+            self._address, self.REG_REBOOT, self.POWER_OFF_MAGIC,
+        )
+
+
+# ===================================================================
 # Helpers
 # ===================================================================
 

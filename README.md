@@ -37,14 +37,13 @@ Compute Module 5 with the Pi Camera Module 3.
 
 ```
 digital-magnifier/
-├── pyproject.toml           # package definition + dependencies
+├── pyproject.toml             # package definition + dependencies
 ├── README.md
-├── requirements.txt         # convenience (pyproject is source of truth)
 ├── .gitignore
 ├── config/
-│   ├── app_config.yaml      # app behaviour, filters, capture, logging
-│   ├── camera_config.yaml   # camera source, resolution, Pi cam settings
-│   └── hardware_pins.yaml   # mock keyboard + future GPIO map
+│   ├── app_config.yaml        # app behaviour, filters, capture, logging
+│   ├── camera_config.yaml     # camera source, resolution, Pi cam settings
+│   └── hardware_pins.yaml     # I²C devices + button/nav event bindings
 ├── src/
 │   └── digital_magnifier/
 │       ├── main.py
@@ -56,7 +55,8 @@ digital-magnifier/
 │       │   ├── camera_base.py       # CameraSensor ABC
 │       │   ├── camera_sensor.py     # MockCameraSensor + PiCameraSensor
 │       │   ├── controls_base.py     # ControlsHAL ABC
-│       │   └── mock_controls.py     # keyboard → AppEvent
+│       │   ├── i2c_devices.py       # TCA6416A + MCP3221 drivers
+│       │   └── mock_controls.py     # MockControls (keyboard) + GPIOControls
 │       ├── processing/
 │       │   ├── magnifier.py         # apply_zoom (digital zoom + pan)
 │       │   └── vision_filters.py    # filters incl. adaptive-threshold binary
@@ -66,8 +66,11 @@ digital-magnifier/
 │           ├── config_loader.py
 │           └── logger.py
 ├── tests/
-│   └── unit/                # 100+ pytest tests
-└── captures/                # output of capture button (gitignored)
+│   └── unit/                  # 280+ pytest tests
+├── scripts/
+│   └── dev/                   # alternative test runners + MVP milestone proofs
+│                              # see scripts/dev/README.md
+└── captures/                  # output of capture button (gitignored)
 ```
 
 ## Setup on the Raspberry Pi CM5

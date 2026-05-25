@@ -76,6 +76,7 @@ import cv2
 import numpy as np
 
 from digital_magnifier.core.events import AppEvent
+from digital_magnifier.core.gallery import Gallery
 from digital_magnifier.core.state_machine import AppState, StateMachine
 from digital_magnifier.hal.camera_base import CameraSensor
 from digital_magnifier.hal.controls_base import ControlsHAL
@@ -108,12 +109,31 @@ class MagnifierApp:
         controls: ControlsHAL,
         image_saver: ImageSaver,
         config: dict[str, Any],
+        *,
+        ups: Any = None,
+        buzzer: Any = None,
     ) -> None:
         # --- injected dependencies --------------------------------
         self._camera = camera
         self._controls = controls
         self._image_saver = image_saver
         self._config = config
+
+        # --- optional UPS HAT for battery display -----------------
+        self._ups = ups
+        self._battery_percent: int = -1      # -1 = unknown / no UPS
+        self._battery_charging: bool = False
+        self._battery_next_read: float = 0.0
+        self._BATTERY_POLL_INTERVAL_S: float = 5.0
+
+        # --- battery alert thresholds -----------------------------
+        self._battery_warned_50: bool = False
+        self._battery_warned_15: bool = False
+        self._battery_shutdown_armed: bool = False
+        self._low_battery_last_beep: float = 0.0
+
+        # --- optional buzzer for audio feedback -------------------
+        self._buzzer = buzzer
 
         # --- read app config --------------------------------------
         app_cfg = config.get("app", {})
@@ -171,16 +191,38 @@ class MagnifierApp:
         # display init flag (so we open the window only once)
         self._window_opened: bool = False
 
+        # --- gallery (MVP 0.4) -------------------------------------
+        # Owns its own zoom / pan / filter state, separate from the
+        # live view, so opening the gallery doesn't carry over the
+        # last zoom level. App controller delegates to it whenever
+        # the state machine is in GALLERY_VIEW.
+        self._gallery = Gallery(
+            image_saver=self._image_saver,
+            display_width=self._cam_width,
+            display_height=self._cam_height,
+            filters_available=self._filters_available,
+            initial_filter=self._filter_default,
+            zoom_min=self._zoom_min,
+            zoom_max=self._zoom_max,
+            zoom_step=self._zoom_step,
+            pan_step=self._pan_step,
+        )
+
         # --- dispatch tables --------------------------------------
         self._in_state_handlers: dict[AppEvent, Callable[[], None]] = {
-            AppEvent.ZOOM_IN:     self._handle_zoom_in,
-            AppEvent.ZOOM_OUT:    self._handle_zoom_out,
-            AppEvent.PAN_UP:      self._handle_pan_up,
-            AppEvent.PAN_DOWN:    self._handle_pan_down,
-            AppEvent.PAN_LEFT:    self._handle_pan_left,
-            AppEvent.PAN_RIGHT:   self._handle_pan_right,
-            AppEvent.FILTER_NEXT: self._handle_filter_next,
-            AppEvent.RESET_VIEW:  self._handle_reset_view,
+            AppEvent.ZOOM_IN:      self._handle_zoom_in,
+            AppEvent.ZOOM_OUT:     self._handle_zoom_out,
+            AppEvent.PAN_UP:       self._handle_pan_up,
+            AppEvent.PAN_DOWN:     self._handle_pan_down,
+            AppEvent.PAN_LEFT:     self._handle_pan_left,
+            AppEvent.PAN_RIGHT:    self._handle_pan_right,
+            AppEvent.FILTER_NEXT:  self._handle_filter_next,
+            AppEvent.RESET_VIEW:   self._handle_reset_view,
+            # In GALLERY_VIEW only: the snapshot button is repurposed
+            # as a "delete current image with confirmation" trigger.
+            # In LIVE/FROZEN this event is a transition, so this
+            # handler doesn't fire from those states.
+            AppEvent.CAPTURE_IMAGE: self._handle_capture_image_in_state,
         }
 
         self._on_enter_handlers: dict[AppState, Callable[[], None]] = {
@@ -212,6 +254,8 @@ class MagnifierApp:
                 # generate STARTUP_COMPLETE from outside.
                 self._state_machine.handle(AppEvent.STARTUP_COMPLETE)
                 self._run_handler_safe(self._on_enter_live, "on_enter_live")
+                if self._buzzer is not None:
+                    self._buzzer.play("startup")
                 self._run_loop()
         finally:
             self._shutdown()
@@ -270,6 +314,8 @@ class MagnifierApp:
           6. Dispatch the event.
         """
         self._check_timed_transitions()
+        self._poll_battery()
+        self._check_low_battery_beep()
 
         frame = self._acquire_frame_for_current_state()
         display = self._render_for_current_state(frame)
@@ -277,6 +323,90 @@ class MagnifierApp:
 
         event = self._controls.poll()
         self._dispatch(event)
+
+    # ------------------------------------------------------------------
+    # Battery
+    # ------------------------------------------------------------------
+
+    def _poll_battery(self) -> None:
+        """Read battery state from the UPS HAT, at most every few seconds."""
+        if self._ups is None:
+            return
+        now = time.monotonic()
+        if now < self._battery_next_read:
+            return
+        self._battery_next_read = now + self._BATTERY_POLL_INTERVAL_S
+        try:
+            status = self._ups.charging_status()
+            self._battery_percent = self._ups.battery_percent()
+            self._battery_charging = bool(status.get("charging", False))
+        except Exception:
+            logger.debug("UPS battery read failed; will retry", exc_info=True)
+            return
+
+        pct = self._battery_percent
+
+        # Reset warnings when charging back above thresholds
+        if self._battery_charging or pct > 55:
+            self._battery_warned_50 = False
+        if self._battery_charging or pct > 20:
+            self._battery_warned_15 = False
+            self._battery_shutdown_armed = False
+
+        # One-time alert crossing below 50%
+        if pct <= 50 and not self._battery_warned_50 and not self._battery_charging:
+            self._battery_warned_50 = True
+            if self._buzzer is not None:
+                self._buzzer.play("battery_50")
+            logger.info("Battery at %d%% — below 50%% threshold", pct)
+
+        # Entering 15% warning zone
+        if pct <= 15 and not self._battery_warned_15 and not self._battery_charging:
+            self._battery_warned_15 = True
+            if self._buzzer is not None:
+                self._buzzer.play("low_battery")
+            logger.warning("Battery at %d%% — charge soon", pct)
+
+        # Critical: initiate shutdown at 10%
+        if pct <= 10 and not self._battery_shutdown_armed and not self._battery_charging:
+            self._battery_shutdown_armed = True
+            logger.critical("Battery at %d%% — initiating safe shutdown", pct)
+            self._initiate_low_battery_shutdown()
+
+    def _check_low_battery_beep(self) -> None:
+        """Called every tick (~24 Hz). Fires a 1 Hz warning beep when
+        battery is between 10% and 15% and not charging."""
+        if (
+            self._buzzer is None
+            or self._battery_percent < 0
+            or self._battery_charging
+        ):
+            return
+        if 10 < self._battery_percent <= 15:
+            now = time.monotonic()
+            if now - self._low_battery_last_beep >= 1.0:
+                self._buzzer.beep(0.08)
+                self._low_battery_last_beep = now
+
+    def _initiate_low_battery_shutdown(self) -> None:
+        """Play shutdown tone, tell UPS to arm power-off, then halt."""
+        import os
+
+        if self._buzzer is not None:
+            self._buzzer.play("shutdown")
+
+        # Tell UPS HAT to cut power once the Pi is down, and to
+        # auto-restart when external power returns.
+        if self._ups is not None:
+            try:
+                self._ups.request_power_off()
+                logger.info("UPS HAT power-off armed")
+            except Exception:
+                logger.warning("Failed to arm UPS power-off", exc_info=True)
+
+        # Trigger OS-level shutdown. This ends the process.
+        logger.info("Calling 'sudo shutdown -h now'")
+        os.system("sudo shutdown -h now")
 
     # ------------------------------------------------------------------
     # Event dispatch
@@ -365,7 +495,8 @@ class MagnifierApp:
             logger.exception("failed to save capture")
 
     def _on_enter_gallery(self) -> None:
-        logger.info("entering GALLERY_VIEW (stub)")
+        logger.info("entering GALLERY_VIEW")
+        self._gallery.open()
 
     def _on_enter_menu(self) -> None:
         logger.info("entering MENU_VIEW (stub)")
@@ -376,8 +507,20 @@ class MagnifierApp:
     # ------------------------------------------------------------------
     # In-state handlers (no transition)
     # ------------------------------------------------------------------
+    #
+    # Each handler routes by current state:
+    #   * In gallery view, delegate to :class:`Gallery` (which owns
+    #     its own zoom / pan / filter state).
+    #   * In live or frozen view, mutate the live view state as before.
+    #   * Otherwise (startup, menu, capture-flash, shutdown), no-op
+    #     — the event won't have reached this handler if the state
+    #     machine wasn't expecting it, but defensive guards stop
+    #     incidental no-ops from corrupting state.
 
     def _handle_zoom_in(self) -> None:
+        if self._is_in_gallery():
+            self._gallery.zoom_in()
+            return
         if not self._is_view_state():
             return
         self._zoom = min(self._zoom + self._zoom_step, self._zoom_max)
@@ -385,6 +528,9 @@ class MagnifierApp:
         logger.debug("zoom -> %.2f", self._zoom)
 
     def _handle_zoom_out(self) -> None:
+        if self._is_in_gallery():
+            self._gallery.zoom_out()
+            return
         if not self._is_view_state():
             return
         new_zoom = max(self._zoom - self._zoom_step, self._zoom_min)
@@ -399,30 +545,48 @@ class MagnifierApp:
         logger.debug("zoom -> %.2f", self._zoom)
 
     def _handle_pan_up(self) -> None:
+        if self._is_in_gallery():
+            self._gallery.pan_up()
+            return
         if not self._is_view_state():
             return
         self._pan_y = max(self._pan_y - self._pan_step, -1.0)
         self._cache_dirty = True
 
     def _handle_pan_down(self) -> None:
+        if self._is_in_gallery():
+            self._gallery.pan_down()
+            return
         if not self._is_view_state():
             return
         self._pan_y = min(self._pan_y + self._pan_step, 1.0)
         self._cache_dirty = True
 
     def _handle_pan_left(self) -> None:
+        # In gallery, left = previous image (the nav switch is the
+        # natural way to flip through captures).
+        if self._is_in_gallery():
+            self._gallery.prev()
+            return
         if not self._is_view_state():
             return
         self._pan_x = max(self._pan_x - self._pan_step, -1.0)
         self._cache_dirty = True
 
     def _handle_pan_right(self) -> None:
+        # In gallery, right = next image.
+        if self._is_in_gallery():
+            self._gallery.next()
+            return
         if not self._is_view_state():
             return
         self._pan_x = min(self._pan_x + self._pan_step, 1.0)
         self._cache_dirty = True
 
     def _handle_filter_next(self) -> None:
+        if self._is_in_gallery():
+            self._gallery.filter_next()
+            return
         if not self._is_view_state():
             return
         self._filter_index = (
@@ -432,6 +596,9 @@ class MagnifierApp:
         logger.debug("filter -> %s", self._current_filter())
 
     def _handle_reset_view(self) -> None:
+        if self._is_in_gallery():
+            self._gallery.reset_view()
+            return
         if not self._is_view_state():
             return
         self._zoom = self._zoom_default
@@ -439,6 +606,17 @@ class MagnifierApp:
         self._pan_y = 0.0
         self._filter_index = self._filter_index_for(self._filter_default)
         self._cache_dirty = True
+
+    def _handle_capture_image_in_state(self) -> None:
+        """CAPTURE_IMAGE event arrived as an *in-state* event.
+
+        That only happens in GALLERY_VIEW (in LIVE/FROZEN it's a
+        transition to CAPTURE_FLASH and never reaches an in-state
+        dispatch). In the gallery it means "delete the current image
+        with confirmation"; see :meth:`Gallery.request_delete`.
+        """
+        if self._is_in_gallery():
+            self._gallery.request_delete()
         logger.info("view reset")
 
     # ------------------------------------------------------------------
@@ -467,7 +645,9 @@ class MagnifierApp:
             return self._frozen_raw_frame
 
         if state == AppState.GALLERY_VIEW:
-            return self._placeholder_frame("GALLERY", "Press [G] or [ to exit")
+            # Gallery owns its own rendering — image load, zoom, pan,
+            # filter, and overlays (count, filename, delete prompt).
+            return self._gallery.render()
 
         if state == AppState.MENU_VIEW:
             return self._placeholder_frame("MENU", "Press [P] or [ to exit")
@@ -502,6 +682,15 @@ class MagnifierApp:
     def _render_for_current_state(self, frame: np.ndarray) -> np.ndarray:
         state = self._state_machine.current_state
 
+        # Gallery short-circuit: the frame returned by
+        # _acquire_frame_for_current_state in GALLERY_VIEW is
+        # already fully rendered by Gallery.render() — zoom, filter,
+        # and gallery-specific overlays already applied. Running it
+        # through _process_frame again would zoom-zoom and filter-
+        # filter using the live-view state, which is wrong.
+        if state == AppState.GALLERY_VIEW:
+            return frame
+
         # Cache fast path for frozen view
         if (
             state == AppState.FROZEN_VIEW
@@ -530,43 +719,122 @@ class MagnifierApp:
         return apply_filter(zoomed, self._current_filter())
 
     def _draw_overlay(self, frame: np.ndarray) -> np.ndarray:
-        """Minimal inline overlay for MVP 0.1.
+        """High-contrast overlay bar for low-vision use.
 
-        Will be replaced by the accessibility UI components in
-        MVP 0.4 (large icons, high-contrast indicators, optional
-        audio cues). Kept inline here to avoid coupling MVP 0.1
-        to a UI implementation that doesn't exist yet.
+        Layout (1280×800 display, 50px top bar):
+
+            ┌───────────────────────────────────────────────────┐
+            │  LIVE VIEW      2.0x  high_contrast    ██  72%  │
+            └───────────────────────────────────────────────────┘
+
+        State label is large and color-coded. Battery bar appears
+        only if a UPS HAT is connected. Zoom / filter labels are
+        suppressed when at default values (1.0x / normal) so the
+        overlay stays uncluttered for the simplest use case.
         """
         h, w = frame.shape[:2]
         out = frame.copy()
 
-        # Top bar background
-        cv2.rectangle(out, (0, 0), (w, 40), (0, 0, 0), -1)
+        # ----- Dimensions tuned for 1280×800 / 800×480 displays -----
+        bar_h = 50
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        thick = 2
 
-        state_label = self._state_machine.current_state.name.replace("_", " ")
+        # Semi-transparent top bar background
+        overlay = out.copy()
+        cv2.rectangle(overlay, (0, 0), (w, bar_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, out, 0.3, 0, out)
+
+        # ----- State label (left side, large, color-coded) -----------
+        state = self._state_machine.current_state
+        _STATE_COLORS = {
+            AppState.LIVE_VIEW:     (0, 230, 0),     # green
+            AppState.FROZEN_VIEW:   (255, 200, 0),   # cyan-ish (BGR)
+            AppState.CAPTURE_FLASH: (255, 255, 255), # white
+            AppState.GALLERY_VIEW:  (0, 220, 255),   # yellow-ish (BGR)
+            AppState.MENU_VIEW:     (200, 200, 200), # grey
+            AppState.SHUTDOWN:      (0, 0, 200),     # red
+        }
+        state_label = state.name.replace("_", " ")
+        state_color = _STATE_COLORS.get(state, (255, 255, 255))
         cv2.putText(
-            out, state_label, (10, 28),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
+            out, state_label, (12, 36),
+            font, 0.9, state_color, thick,
         )
 
-        zoom_label = f"{self._zoom:.1f}x"
-        (tw, _), _ = cv2.getTextSize(
-            zoom_label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2,
-        )
-        cv2.putText(
-            out, zoom_label, ((w - tw) // 2, 28),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2,
-        )
+        # ----- Zoom + filter (centre, smaller, only when non-default) -
+        info_parts = []
+        if self._zoom > 1.05:
+            info_parts.append(f"{self._zoom:.1f}x")
+        filt = self._current_filter()
+        if filt != "normal":
+            info_parts.append(filt)
+        if info_parts:
+            info_text = "  ".join(info_parts)
+            (tw, _), _ = cv2.getTextSize(info_text, font, 0.7, thick)
+            cv2.putText(
+                out, info_text, ((w - tw) // 2, 34),
+                font, 0.7, (0, 255, 255), thick,
+            )
 
-        filter_label = self._current_filter()
-        (tw, _), _ = cv2.getTextSize(
-            filter_label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2,
-        )
-        cv2.putText(
-            out, filter_label, (w - tw - 10, 28),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
-        )
+        # ----- Battery bar (right side) ------------------------------
+        if self._battery_percent >= 0:
+            self._draw_battery_bar(out, w, bar_h)
+
         return out
+
+    def _draw_battery_bar(
+        self, frame: np.ndarray, frame_w: int, bar_h: int,
+    ) -> None:
+        """Draw a large, high-contrast battery indicator in the top-right."""
+        pct = max(0, min(100, self._battery_percent))
+
+        # Bar geometry
+        bar_w = 100
+        bar_inner_h = 22
+        margin_right = 14
+        margin_top = (bar_h - bar_inner_h) // 2
+
+        x2 = frame_w - margin_right
+        x1 = x2 - bar_w
+        y1 = margin_top
+        y2 = y1 + bar_inner_h
+
+        # Color based on level
+        if pct > 50:
+            color = (0, 200, 0)      # green
+        elif pct > 20:
+            color = (0, 200, 255)    # yellow (BGR)
+        else:
+            color = (0, 0, 220)      # red
+
+        # Charging indicator: use a brighter version
+        if self._battery_charging:
+            color = (200, 200, 0)    # cyan = charging (BGR)
+
+        # Border
+        cv2.rectangle(frame, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2),
+                       (200, 200, 200), 1)
+        # Terminal nub
+        cv2.rectangle(frame, (x2 + 2, y1 + 4), (x2 + 6, y2 - 4),
+                       (200, 200, 200), -1)
+
+        # Fill
+        fill_w = int((pct / 100.0) * bar_w)
+        if fill_w > 0:
+            cv2.rectangle(frame, (x1, y1), (x1 + fill_w, y2), color, -1)
+
+        # Percentage text to the left of the bar
+        label = f"{pct}%"
+        if self._battery_charging:
+            label = f"CHG {pct}%"
+        (tw, _), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2,
+        )
+        cv2.putText(
+            frame, label, (x1 - tw - 8, y2 - 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
+        )
 
     def _apply_capture_flash(self, frame: np.ndarray) -> np.ndarray:
         """White-tint the frame to indicate a capture just happened."""
@@ -623,6 +891,15 @@ class MagnifierApp:
             AppState.FROZEN_VIEW,
         )
 
+    def _is_in_gallery(self) -> bool:
+        """True if the current state is GALLERY_VIEW.
+
+        Used by the in-state handlers to route events to the
+        :class:`Gallery` instance instead of mutating the live-view
+        zoom / pan / filter state.
+        """
+        return self._state_machine.current_state == AppState.GALLERY_VIEW
+
     def _current_filter(self) -> str:
         return self._filters_available[self._filter_index]
 
@@ -659,8 +936,18 @@ class MagnifierApp:
 
     def _shutdown(self) -> None:
         logger.info("MagnifierApp shutting down")
+        if self._buzzer is not None:
+            try:
+                self._buzzer.play("shutdown")
+            except Exception:
+                pass
         try:
             if self._window_opened:
                 cv2.destroyAllWindows()
         except Exception:
             logger.exception("error destroying windows")
+        if self._buzzer is not None:
+            try:
+                self._buzzer.close()
+            except Exception:
+                pass

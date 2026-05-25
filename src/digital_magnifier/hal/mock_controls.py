@@ -198,6 +198,30 @@ from digital_magnifier.hal.i2c_devices import (
 )
 
 
+class _TimedButtonState:
+    """Tracks a button that emits different events for short vs long press.
+
+    Unlike regular ``button_events`` (fire on press edge), timed buttons
+    fire on *release* if held less than ``threshold_s`` (short event) or
+    as soon as the hold threshold is reached (long event). The long event
+    fires once; subsequent release is a no-op to avoid double-firing.
+    """
+    __slots__ = ("short_event", "long_event", "threshold_s",
+                 "pressed_at", "long_fired")
+
+    def __init__(
+        self,
+        short_event: AppEvent,
+        long_event: AppEvent,
+        threshold_s: float,
+    ) -> None:
+        self.short_event = short_event
+        self.long_event = long_event
+        self.threshold_s = threshold_s
+        self.pressed_at: Optional[float] = None
+        self.long_fired: bool = False
+
+
 class GPIOControls(ControlsHAL):
     """Controls HAL backed by a TCA6416A I/O expander and optional MCP3221 ADC.
 
@@ -259,10 +283,6 @@ class GPIOControls(ControlsHAL):
         # Nav directions: input_name → AppEvent (fires on press, optionally repeats)
         self._nav_events: dict[str, AppEvent] = {}
 
-        # ---- Power button special-casing ------------------------
-        self._power_input: Optional[str] = None
-        self._power_threshold_ms: int = 1000
-
         # ---- Nav repeat config ----------------------------------
         self._nav_repeat_enabled: bool = True
         self._nav_repeat_initial_delay_s: float = 0.4
@@ -280,6 +300,14 @@ class GPIOControls(ControlsHAL):
         self._zoom_invert: bool = False
         self._zoom_debounce_reads: int = 2
 
+        # ---- Timed buttons (short vs long press) -----------------
+        # Maps input name → tracking state. Loaded from
+        # ``snapshot_button`` + ``power_button`` config sections.
+        # Unlike regular ``button_events`` (which fire on press
+        # edge), timed buttons fire on *release* (short press) or
+        # when the hold threshold is reached (long press).
+        self._timed_buttons: dict[str, _TimedButtonState] = {}
+
         # ---- Runtime state --------------------------------------
         # Last observed input word from the expander, used for
         # edge detection. -1 = "never read".
@@ -288,8 +316,6 @@ class GPIOControls(ControlsHAL):
         self._press_started: dict[str, Optional[float]] = {}
         # Per-nav next repeat time (None = not held / not started).
         self._nav_next_repeat: dict[str, Optional[float]] = {}
-        # Whether POWER_LONG_PRESS has already fired for the current hold.
-        self._power_long_fired: bool = False
 
         # ---- Zoom pot tracking ----------------------------------
         # Last bucket we emitted at. None = no read yet.
@@ -421,6 +447,12 @@ class GPIOControls(ControlsHAL):
                 self._press_started[name] = None
 
     def _on_press(self, name: str, now: float) -> None:
+        # Timed buttons don't fire on press — they fire on release
+        # (short) or after the hold threshold (long).
+        if name in self._timed_buttons:
+            self._timed_buttons[name].long_fired = False
+            return
+
         # Action buttons fire their event immediately on press.
         if name in self._button_events:
             self._queue(self._button_events[name])
@@ -434,40 +466,36 @@ class GPIOControls(ControlsHAL):
             else:
                 self._nav_next_repeat[name] = None
 
-        # Power button: just record press; emit nothing yet.
-        if name == self._power_input:
-            self._power_long_fired = False
-
     def _on_release(self, name: str, now: float) -> None:
-        if name == self._power_input:
-            # Short press only if we haven't already fired long.
-            if not self._power_long_fired:
+        # Timed buttons: short event fires on release if the hold
+        # threshold wasn't reached; if it was, long already fired.
+        tb = self._timed_buttons.get(name)
+        if tb is not None:
+            if not tb.long_fired:
                 press_start = self._press_started.get(name)
                 if press_start is not None:
-                    held_ms = (now - press_start) * 1000.0
-                    if held_ms < self._power_threshold_ms:
-                        self._queue(AppEvent.POWER_SHORT_PRESS)
-            self._power_long_fired = False
+                    if (now - press_start) < tb.threshold_s:
+                        self._queue(tb.short_event)
+            tb.long_fired = False
+            return
 
         # Nav release: cancel any pending repeat.
         if name in self._nav_events:
             self._nav_next_repeat[name] = None
 
     def _process_long_press(self, inputs: int, now: float) -> None:
-        if self._power_input is None or self._power_long_fired:
-            return
-        press_start = self._press_started.get(self._power_input)
-        if press_start is None:
-            return
-        # Confirm the button is still pressed (defensive: should
-        # always be true if press_started is set).
-        mask = self._input_mask.get(self._power_input)
-        if mask is None or (inputs & mask) != 0:
-            return
-        held_ms = (now - press_start) * 1000.0
-        if held_ms >= self._power_threshold_ms:
-            self._queue(AppEvent.POWER_LONG_PRESS)
-            self._power_long_fired = True
+        for name, tb in self._timed_buttons.items():
+            if tb.long_fired:
+                continue
+            press_start = self._press_started.get(name)
+            if press_start is None:
+                continue
+            mask = self._input_mask.get(name)
+            if mask is None or (inputs & mask) != 0:
+                continue   # button not currently pressed
+            if (now - press_start) >= tb.threshold_s:
+                self._queue(tb.long_event)
+                tb.long_fired = True
 
     def _process_nav_repeat(self, inputs: int, now: float) -> None:
         if not self._nav_repeat_enabled:
@@ -605,27 +633,78 @@ class GPIOControls(ControlsHAL):
             self._nav_repeat_initial_delay_s = 0.4
             self._nav_repeat_interval_s = 0.1
 
-        # --- Power button -------------------------------------
+        # --- Timed buttons (short / long press) -------------------
+        # Power button: hardcoded events (backward compat).
         power_cfg = cfg.get("power_button", {})
         power_input = power_cfg.get("input")
         if power_input:
             if power_input in self._input_pins:
-                self._power_input = power_input
                 try:
-                    self._power_threshold_ms = int(
+                    threshold_ms = int(
                         power_cfg.get("long_press_threshold_ms", 1000)
                     )
                 except (TypeError, ValueError):
                     logger.warning(
-                        "power_button.long_press_threshold_ms invalid; using 1000"
+                        "power_button.long_press_threshold_ms invalid; "
+                        "using 1000"
                     )
-                    self._power_threshold_ms = 1000
+                    threshold_ms = 1000
+                self._timed_buttons[power_input] = _TimedButtonState(
+                    short_event=AppEvent.POWER_SHORT_PRESS,
+                    long_event=AppEvent.POWER_LONG_PRESS,
+                    threshold_s=threshold_ms / 1000.0,
+                )
                 self._press_started.setdefault(power_input, None)
             else:
                 logger.warning(
                     "power_button.input %r is not a defined input; "
                     "power button disabled",
                     power_input,
+                )
+
+        # Snapshot button: tap=freeze, hold=capture (configurable).
+        snap_cfg = cfg.get("snapshot_button", {})
+        snap_input = snap_cfg.get("input")
+        if snap_input:
+            if snap_input in self._input_pins:
+                short_ev = self._parse_event(
+                    snap_cfg.get("short_event", "FREEZE_TOGGLE"),
+                    "snapshot_button.short_event",
+                )
+                long_ev = self._parse_event(
+                    snap_cfg.get("long_event", "CAPTURE_IMAGE"),
+                    "snapshot_button.long_event",
+                )
+                if short_ev and long_ev:
+                    try:
+                        threshold_ms = int(
+                            snap_cfg.get("long_press_threshold_ms", 3000)
+                        )
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "snapshot_button.long_press_threshold_ms "
+                            "invalid; using 3000"
+                        )
+                        threshold_ms = 3000
+                    self._timed_buttons[snap_input] = _TimedButtonState(
+                        short_event=short_ev,
+                        long_event=long_ev,
+                        threshold_s=threshold_ms / 1000.0,
+                    )
+                    self._press_started.setdefault(snap_input, None)
+                    # Warn if it's also in button_events (double-fire risk).
+                    if snap_input in self._button_events:
+                        logger.warning(
+                            "snapshot_button.input %r is also in "
+                            "button_events; remove it from button_events "
+                            "to avoid double-firing",
+                            snap_input,
+                        )
+            else:
+                logger.warning(
+                    "snapshot_button.input %r is not a defined input; "
+                    "snapshot button disabled",
+                    snap_input,
                 )
 
         # --- Poll interval ------------------------------------
@@ -654,13 +733,17 @@ class GPIOControls(ControlsHAL):
         except (TypeError, ValueError):
             self._zoom_debounce_reads = 2
 
+        timed_names = ", ".join(
+            f"{n}(short={tb.short_event.name}, long={tb.long_event.name})"
+            for n, tb in self._timed_buttons.items()
+        ) or "none"
         logger.info(
             "GPIOControls: %d inputs, %d action buttons, %d nav directions, "
-            "power=%s, zoom_pot=%s",
+            "timed=[%s], zoom_pot=%s",
             len(self._input_pins),
             len(self._button_events),
             len(self._nav_events),
-            self._power_input,
+            timed_names,
             "enabled" if self._adc is not None else "disabled",
         )
 

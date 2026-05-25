@@ -398,3 +398,203 @@ class TestMCP3221Probe:
         bus.fail_on_raw_read = True
         with pytest.raises(I2CError):
             adc.probe()
+
+
+# ===================================================================
+# UPS HAT (E)
+# ===================================================================
+
+
+from digital_magnifier.hal.i2c_devices import UPSHatE, UPSStatus
+
+
+def _set_word(bus, addr, low_reg, value):
+    """Helper: store an unsigned 16-bit value at consecutive registers."""
+    bus.registers[(addr, low_reg)] = value & 0xFF
+    bus.registers[(addr, low_reg + 1)] = (value >> 8) & 0xFF
+
+
+def _set_signed_word(bus, addr, low_reg, value):
+    if value < 0:
+        value = value + 0x10000
+    _set_word(bus, addr, low_reg, value & 0xFFFF)
+
+
+class TestUPSConstruction:
+    def test_default_address(self, bus):
+        ups = UPSHatE(bus)
+        assert ups is not None
+
+    @pytest.mark.parametrize("address", [-1, 0x80, 0xFF])
+    def test_bad_address_raises(self, bus, address):
+        with pytest.raises(ValueError):
+            UPSHatE(bus, address=address)
+
+
+class TestUPSProbe:
+    def test_probe_succeeds_when_id_matches(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        bus.registers[(0x2D, 0x00)] = 0x0A   # expected ID
+        ups.probe()   # must not raise
+
+    def test_probe_raises_when_id_wrong(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        bus.registers[(0x2D, 0x00)] = 0x55   # not the magic 0x0A
+        with pytest.raises(I2CError, match="ID register"):
+            ups.probe()
+
+    def test_probe_raises_when_chip_missing(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        bus.fail_on_address = 0x2D
+        with pytest.raises(I2CError):
+            ups.probe()
+
+
+class TestUPSReadsUnsignedWords:
+    def test_battery_percent(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        _set_word(bus, 0x2D, UPSHatE.REG_BATT_PERCENT, 73)
+        assert ups.battery_percent() == 73
+
+    def test_battery_voltage(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        _set_word(bus, 0x2D, UPSHatE.REG_BATT_VOLTAGE, 12_345)
+        assert ups.battery_voltage_mv() == 12_345
+
+    def test_vbus_voltage(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        _set_word(bus, 0x2D, UPSHatE.REG_VBUS_VOLTAGE, 5_023)
+        assert ups.vbus_voltage_mv() == 5_023
+
+    def test_vbus_power(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        _set_word(bus, 0x2D, UPSHatE.REG_VBUS_POWER, 7_500)
+        assert ups.vbus_power_mw() == 7_500
+
+
+class TestUPSReadsSignedBatteryCurrent:
+    def test_positive_current_means_charging(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        _set_signed_word(bus, 0x2D, UPSHatE.REG_BATT_CURRENT, +450)
+        assert ups.battery_current_ma() == 450
+
+    def test_negative_current_means_discharging(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        _set_signed_word(bus, 0x2D, UPSHatE.REG_BATT_CURRENT, -1200)
+        assert ups.battery_current_ma() == -1200
+
+    def test_full_negative_swing(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        _set_signed_word(bus, 0x2D, UPSHatE.REG_BATT_CURRENT, -32_768)
+        assert ups.battery_current_ma() == -32_768
+
+    def test_full_positive_swing(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        _set_signed_word(bus, 0x2D, UPSHatE.REG_BATT_CURRENT, 32_767)
+        assert ups.battery_current_ma() == 32_767
+
+
+class TestUPSChargingStatus:
+    @pytest.mark.parametrize(
+        "byte,expected",
+        [
+            (0b00000_000, ("standby", False, False, False)),
+            (0b00000_001, ("trickle", False, False, False)),
+            (0b00000_010, ("constant_current", False, False, False)),
+            (0b00000_011, ("constant_voltage", False, False, False)),
+            (0b00000_100, ("pending", False, False, False)),
+            (0b00000_101, ("full", False, False, False)),
+            (0b00000_110, ("timeout", False, False, False)),
+            # Top bits in various combinations:
+            (0b10000_001, ("trickle", True, False, False)),    # charging
+            (0b01000_010, ("constant_current", False, True, False)),  # fast
+            (0b00100_011, ("constant_voltage", False, False, True)),  # vbus
+            (0b11100_101, ("full", True, True, True)),          # everything
+        ],
+    )
+    def test_decodes_status_byte(self, bus, byte, expected):
+        state, charging, fast, vbus = expected
+        ups = UPSHatE(bus, address=0x2D)
+        bus.registers[(0x2D, UPSHatE.REG_CHARGE_STATUS)] = byte
+        result = ups.charging_status()
+        assert result["charge_state"] == state
+        assert result["charging"] == charging
+        assert result["fast_charging"] == fast
+        assert result["vbus_powered"] == vbus
+
+    def test_unknown_state_falls_back_to_unknown(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        bus.registers[(0x2D, UPSHatE.REG_CHARGE_STATUS)] = 0b00000_111   # not in table
+        assert ups.charging_status()["charge_state"] == "unknown"
+
+
+class TestUPSCellVoltage:
+    def test_each_cell_register_pair(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        _set_word(bus, 0x2D, UPSHatE.REG_CELL_BASE + 0, 3_700)   # cell 1
+        _set_word(bus, 0x2D, UPSHatE.REG_CELL_BASE + 2, 3_710)   # cell 2
+        _set_word(bus, 0x2D, UPSHatE.REG_CELL_BASE + 4, 3_690)   # cell 3
+        _set_word(bus, 0x2D, UPSHatE.REG_CELL_BASE + 6, 3_705)   # cell 4
+        assert ups.cell_voltage_mv(1) == 3_700
+        assert ups.cell_voltage_mv(2) == 3_710
+        assert ups.cell_voltage_mv(3) == 3_690
+        assert ups.cell_voltage_mv(4) == 3_705
+
+    @pytest.mark.parametrize("cell", [0, 5, -1, 99])
+    def test_bad_cell_index(self, bus, cell):
+        ups = UPSHatE(bus, address=0x2D)
+        with pytest.raises(ValueError):
+            ups.cell_voltage_mv(cell)
+
+
+class TestUPSReadSummary:
+    def test_assembles_full_status(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+
+        # Charging state byte: charging, fast charging, vbus powered, CC state
+        bus.registers[(0x2D, UPSHatE.REG_CHARGE_STATUS)] = 0b11100_010
+
+        # VBUS readings
+        _set_word(bus, 0x2D, UPSHatE.REG_VBUS_VOLTAGE, 5_010)
+        _set_word(bus, 0x2D, UPSHatE.REG_VBUS_CURRENT, 1_500)
+        _set_word(bus, 0x2D, UPSHatE.REG_VBUS_POWER, 7_500)
+
+        # Battery readings
+        _set_word(bus, 0x2D, UPSHatE.REG_BATT_VOLTAGE, 11_900)
+        _set_signed_word(bus, 0x2D, UPSHatE.REG_BATT_CURRENT, +800)
+        _set_word(bus, 0x2D, UPSHatE.REG_BATT_PERCENT, 65)
+        _set_word(bus, 0x2D, UPSHatE.REG_BATT_REMAIN_CAPACITY, 1_950)
+        _set_word(bus, 0x2D, UPSHatE.REG_BATT_DISCHARGE_MIN, 240)
+        _set_word(bus, 0x2D, UPSHatE.REG_BATT_CHARGE_MIN, 60)
+
+        # Cell voltages
+        for i in range(4):
+            _set_word(bus, 0x2D, UPSHatE.REG_CELL_BASE + i * 2, 2_975 + i * 5)
+
+        summary = ups.read_summary()
+        assert isinstance(summary, UPSStatus)
+        assert summary.charging is True
+        assert summary.fast_charging is True
+        assert summary.vbus_powered is True
+        assert summary.charge_state == "constant_current"
+        assert summary.vbus_voltage_mv == 5_010
+        assert summary.vbus_current_ma == 1_500
+        assert summary.battery_percent == 65
+        assert summary.battery_current_ma == 800
+        assert summary.battery_remaining_capacity_mah == 1_950
+        assert summary.remaining_discharge_min == 240
+        assert summary.remaining_charge_min == 60
+        assert summary.cell_voltages_mv == (2_975, 2_980, 2_985, 2_990)
+
+
+class TestUPSPowerOff:
+    def test_writes_magic_to_reboot_register(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        ups.request_power_off()
+        assert (0x2D, UPSHatE.REG_REBOOT, 0x55) in bus.write_log
+
+    def test_io_failure_propagates(self, bus):
+        ups = UPSHatE(bus, address=0x2D)
+        bus.fail_on_address = 0x2D
+        with pytest.raises(I2CError):
+            ups.request_power_off()
