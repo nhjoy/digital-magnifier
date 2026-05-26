@@ -135,11 +135,21 @@ class MagnifierApp:
         # --- optional buzzer for audio feedback -------------------
         self._buzzer = buzzer
 
+        # --- status overlay (toggled by ADD3 long-press) ---------
+        self._show_status: bool = False
+
+        # --- loading splash (startup_time set here; duration
+        #     read from app config below once app_cfg exists) -----
+        self._startup_time: float = time.monotonic()
+
         # --- read app config --------------------------------------
         app_cfg = config.get("app", {})
         self._target_fps: float = float(app_cfg.get("target_fps", 24))
         self._show_overlay: bool = bool(app_cfg.get("show_overlay", True))
         self._fullscreen: bool = bool(app_cfg.get("fullscreen", False))
+        self._SPLASH_DURATION_S: float = float(
+            app_cfg.get("splash_duration_s", 5.0)
+        )
 
         mag_cfg = config.get("magnifier", {})
         self._zoom_min: float = float(mag_cfg.get("min_zoom", 1.0))
@@ -152,6 +162,11 @@ class MagnifierApp:
         self._filter_default: str = str(filter_cfg.get("default", "normal"))
         self._filters_available: list[str] = list(
             filter_cfg.get("available", ["normal"])
+        )
+        # Per-filter parameters — passed to apply_filter as kwargs.
+        # Shape: {filter_name: {param: value, ...}}
+        self._filter_config: dict[str, dict[str, Any]] = (
+            filter_cfg.get("config", {}) or {}
         )
 
         capture_cfg = config.get("capture", {})
@@ -202,6 +217,7 @@ class MagnifierApp:
             display_height=self._cam_height,
             filters_available=self._filters_available,
             initial_filter=self._filter_default,
+            filter_config=self._filter_config,
             zoom_min=self._zoom_min,
             zoom_max=self._zoom_max,
             zoom_step=self._zoom_step,
@@ -218,6 +234,7 @@ class MagnifierApp:
             AppEvent.PAN_RIGHT:    self._handle_pan_right,
             AppEvent.FILTER_NEXT:  self._handle_filter_next,
             AppEvent.RESET_VIEW:   self._handle_reset_view,
+            AppEvent.STATUS_TOGGLE: self._handle_status_toggle,
             # In GALLERY_VIEW only: the snapshot button is repurposed
             # as a "delete current image with confirmation" trigger.
             # In LIVE/FROZEN this event is a transition, so this
@@ -607,6 +624,22 @@ class MagnifierApp:
         self._filter_index = self._filter_index_for(self._filter_default)
         self._cache_dirty = True
 
+    def _handle_status_toggle(self) -> None:
+        """Toggle the fullscreen status overlay (battery, state, zoom, ...).
+
+        Triggered by a 5-second hold of ADD3. The overlay sits *on top*
+        of the normal render — when active, ``_render_for_current_state``
+        returns a status frame instead of the usual view, but the
+        underlying state machine is unchanged so zoom / pan / filter
+        actions still take effect behind it (visible again when the
+        overlay is dismissed).
+        """
+        self._show_status = not self._show_status
+        logger.info(
+            "Status overlay %s",
+            "shown" if self._show_status else "hidden",
+        )
+
     def _handle_capture_image_in_state(self) -> None:
         """CAPTURE_IMAGE event arrived as an *in-state* event.
 
@@ -682,6 +715,20 @@ class MagnifierApp:
     def _render_for_current_state(self, frame: np.ndarray) -> np.ndarray:
         state = self._state_machine.current_state
 
+        # Loading splash for the first N seconds of the session, so
+        # the user sees something while picamera2 initialises (which
+        # can take 2-3 seconds on the CM5).
+        elapsed = time.monotonic() - self._startup_time
+        if elapsed < self._SPLASH_DURATION_S:
+            return self._render_splash_screen(frame, elapsed)
+
+        # Status overlay: a long-press of ADD3 toggles this. It
+        # replaces the normal render with a big, readable summary
+        # of device state. Underlying state machine continues to
+        # run, so the view restores cleanly on toggle-off.
+        if self._show_status:
+            return self._render_status_screen(frame)
+
         # Gallery short-circuit: the frame returned by
         # _acquire_frame_for_current_state in GALLERY_VIEW is
         # already fully rendered by Gallery.render() — zoom, filter,
@@ -716,7 +763,109 @@ class MagnifierApp:
     def _process_frame(self, frame: np.ndarray) -> np.ndarray:
         """Apply zoom, pan, and filter. Pure of state — easy to test."""
         zoomed = apply_zoom(frame, self._zoom, self._pan_x, self._pan_y)
-        return apply_filter(zoomed, self._current_filter())
+        return apply_filter(zoomed, self._current_filter(), self._filter_config)
+
+    def _render_splash_screen(
+        self, frame: np.ndarray, elapsed: float,
+    ) -> np.ndarray:
+        """Fullscreen loading splash shown for the first few seconds.
+
+        Solid dark background with the device name and a subtle dot
+        progress indicator. We render programmatically (no image
+        asset needed) so the first run on a fresh CM5 doesn't fail
+        for a missing file.
+        """
+        h, w = frame.shape[:2]
+        splash = np.full((h, w, 3), 0, dtype=np.uint8)
+        splash[:, :] = (32, 24, 16)            # BGR: warm dark
+
+        # Title
+        self._draw_centered_text(
+            splash, "MAGNIFIER", -30,
+            scale=3.0, thickness=8, color=(255, 255, 255),
+        )
+        # Subtitle
+        self._draw_centered_text(
+            splash, "Loading...", 60,
+            scale=1.2, thickness=2, color=(180, 180, 180),
+        )
+
+        # Progress dots — fill in as elapsed approaches SPLASH_DURATION_S.
+        steps = int((elapsed / self._SPLASH_DURATION_S) * 4)
+        steps = max(0, min(3, steps))
+        cx, cy = w // 2, h // 2 + 130
+        for i in range(3):
+            x = cx - 40 + i * 40
+            color = (0, 220, 0) if i < steps else (80, 80, 80)
+            cv2.circle(splash, (x, cy), 8, color, -1)
+
+        return splash
+
+    def _render_status_screen(self, frame: np.ndarray) -> np.ndarray:
+        """Fullscreen device-status overlay (ADD3 long-press).
+
+        Big, high-contrast text for low-vision users. Shows the
+        key things a parent or older child might want to glance at
+        without entering the menu.
+        """
+        h, w = frame.shape[:2]
+        out = np.full((h, w, 3), 0, dtype=np.uint8)
+        out[:, :] = (40, 30, 20)               # BGR: dark navy/grey
+
+        # Title bar
+        cv2.rectangle(out, (0, 0), (w, 70), (60, 50, 40), -1)
+        self._draw_centered_text(
+            out, "DEVICE STATUS", -(h // 2 - 46),
+            scale=1.3, thickness=3, color=(255, 255, 255),
+        )
+
+        # Battery — biggest line on the screen.
+        if self._battery_percent >= 0:
+            if self._battery_charging:
+                batt_text = f"BATTERY: {self._battery_percent}%  CHARGING"
+                batt_color = (200, 200, 0)     # cyan = charging
+            else:
+                pct = self._battery_percent
+                batt_text = f"BATTERY: {pct}%"
+                batt_color = (
+                    (0, 220, 0) if pct > 50 else
+                    (0, 200, 255) if pct > 20 else
+                    (0, 0, 220)
+                )
+        else:
+            batt_text = "BATTERY: not detected"
+            batt_color = (180, 180, 180)
+        self._draw_centered_text(
+            out, batt_text, -80,
+            scale=1.6, thickness=4, color=batt_color,
+        )
+
+        # Lower info lines
+        state_name = self._state_machine.current_state.name.replace("_", " ")
+        try:
+            photos = len(self._image_saver.list_images())
+        except Exception:
+            photos = 0
+        info_lines = [
+            ("MODE",   state_name),
+            ("ZOOM",   f"{self._zoom:.1f}x"),
+            ("FILTER", self._current_filter()),
+            ("PHOTOS", f"{photos} saved"),
+        ]
+        for i, (label, value) in enumerate(info_lines):
+            line = f"{label}:  {value}"
+            self._draw_centered_text(
+                out, line, 10 + i * 60,
+                scale=1.1, thickness=3, color=(230, 230, 230),
+            )
+
+        # Dismiss hint at the bottom
+        self._draw_centered_text(
+            out, "Hold ADD3 for 5 seconds to dismiss",
+            h // 2 - 60,
+            scale=0.7, thickness=2, color=(150, 150, 150),
+        )
+        return out
 
     def _draw_overlay(self, frame: np.ndarray) -> np.ndarray:
         """High-contrast overlay bar for low-vision use.

@@ -98,6 +98,12 @@ class FakeImageSaver:
         self.saved_frames.append(frame.copy())
         return Path(f"/tmp/fake-captures/capture_{len(self.saved_frames):04d}.png")
 
+    def list_images(self, newest_first: bool = True) -> list[Path]:
+        return []
+
+    def delete_image(self, path: Path) -> None:
+        pass
+
 
 # --------------------------------------------------------------------------- #
 # Fixtures
@@ -109,6 +115,7 @@ def config() -> dict:
         "app": {
             "target_fps": 60,    # high fps so tests aren't slowed
             "show_overlay": False,
+            "splash_duration_s": 0,
         },
         "magnifier": {
             "min_zoom": 1.0,

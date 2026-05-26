@@ -50,6 +50,11 @@ class AppEvent(Enum):
     POWER_SHORT_PRESS = auto()
     POWER_LONG_PRESS = auto()
 
+    # --- status overlay ----------------------------------------------
+    # Long press of ADD3 (5s) toggles a fullscreen status screen
+    # showing battery, state, zoom, filter, etc. in big text.
+    STATUS_TOGGLE = auto()
+
     # --- developer convenience ---------------------------------------
     # The mock keyboard maps 'q' to this so the dev can exit without
     # exercising the power-long-press code path during testing.

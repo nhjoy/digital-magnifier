@@ -361,6 +361,11 @@ def _gpio_config() -> dict:
             "long_event": "CAPTURE_IMAGE",
             "long_press_threshold_ms": 3000,
         },
+        "status_button": {
+            "input": "add3",
+            "long_event": "STATUS_TOGGLE",
+            "long_press_threshold_ms": 5000,
+        },
         "nav_events": {
             "nav_up":     "PAN_UP",
             "nav_down":   "PAN_DOWN",
@@ -373,10 +378,7 @@ def _gpio_config() -> dict:
             "initial_delay_ms": 400,
             "interval_ms": 100,
         },
-        "power_button": {
-            "input": "add3",
-            "long_press_threshold_ms": 1000,
-        },
+        "power_button": {},
         "zoom_pot": {"buckets": 16, "invert": False, "debounce_reads": 1},
     }
 
@@ -543,11 +545,20 @@ class TestGPIOControlsNav:
         assert events.count(AppEvent.PAN_UP) == 3   # press + 2 repeats
 
 
+def _power_button_config() -> dict:
+    """Config where add3 is the power button (for backward-compat tests)."""
+    cfg = _gpio_config()
+    cfg["power_button"] = {"input": "add3", "long_press_threshold_ms": 1000}
+    del cfg["status_button"]
+    return cfg
+
+
 class TestGPIOControlsPowerButton:
     def test_short_press_fires_on_release(self):
         pressed = 0xFFFF & ~(1 << 10)            # P12 LOW = add3 pressed
         controls, clock, _ = _build_gpio_controls(
             scripted_inputs=[0xFFFF, pressed, 0xFFFF],
+            cfg=_power_button_config(),
         )
         clock.advance(0.030); controls.poll()    # anchor
         clock.advance(0.030)
@@ -559,6 +570,7 @@ class TestGPIOControlsPowerButton:
         pressed = 0xFFFF & ~(1 << 10)
         controls, clock, _ = _build_gpio_controls(
             scripted_inputs=[0xFFFF] + [pressed] * 4,
+            cfg=_power_button_config(),
         )
         clock.advance(0.030); controls.poll()
         clock.advance(0.030); controls.poll()    # press edge
@@ -571,6 +583,7 @@ class TestGPIOControlsPowerButton:
         pressed = 0xFFFF & ~(1 << 10)
         controls, clock, _ = _build_gpio_controls(
             scripted_inputs=[0xFFFF, pressed, pressed, 0xFFFF],
+            cfg=_power_button_config(),
         )
         clock.advance(0.030); controls.poll()
         clock.advance(0.030); controls.poll()
@@ -578,6 +591,32 @@ class TestGPIOControlsPowerButton:
         assert controls.poll() == AppEvent.POWER_LONG_PRESS
         clock.advance(0.030)
         assert controls.poll() == AppEvent.NONE
+
+
+class TestGPIOControlsStatusButton:
+    def test_tap_does_nothing(self):
+        # Status button has no short_event — tapping is a no-op.
+        pressed = 0xFFFF & ~(1 << 10)            # P12 LOW = add3
+        controls, clock, _ = _build_gpio_controls(
+            scripted_inputs=[0xFFFF, pressed, 0xFFFF],
+        )
+        clock.advance(0.030); controls.poll()    # anchor
+        clock.advance(0.030)
+        assert controls.poll() == AppEvent.NONE  # press
+        clock.advance(0.200)
+        assert controls.poll() == AppEvent.NONE  # release — no event
+
+    def test_hold_5s_fires_status_toggle(self):
+        pressed = 0xFFFF & ~(1 << 10)
+        controls, clock, _ = _build_gpio_controls(
+            scripted_inputs=[0xFFFF] + [pressed] * 6,
+        )
+        clock.advance(0.030); controls.poll()    # anchor
+        clock.advance(0.030); controls.poll()    # press
+        clock.advance(2.5)
+        assert controls.poll() == AppEvent.NONE  # still under 5s
+        clock.advance(3.0)                       # total 5.5s
+        assert controls.poll() == AppEvent.STATUS_TOGGLE
 
 
 class TestGPIOControlsZoomPot:

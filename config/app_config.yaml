@@ -28,7 +28,7 @@ magnifier:
   # Step per ZOOM_IN / ZOOM_OUT event. With keyboard mock, every
   # press is one step; with real pot in MVP 0.3, steps are
   # generated as the pot crosses thresholds.
-  zoom_step: 0.1
+  zoom_step: 0.5
   default_zoom: 1.0
   # Pan offset (normalised, -1..+1) per nav-switch event.
   pan_step: 0.1
@@ -37,15 +37,41 @@ magnifier:
 filters:
   # The filter active at startup and after RESET_VIEW.
   default: normal
-  # Order = cycle order when the user presses Filter Next.
+
+  # Cycle order when the user presses Filter Next (CLR_BTN).
+  # Comment out a line to remove that filter from the rotation;
+  # the device will skip it without restart needed.
   # All names must exist in
   # digital_magnifier.processing.vision_filters.AVAILABLE_FILTERS.
   available:
-    - normal
-    - grayscale
-    - high_contrast
-    - inverted
-    - binary
+    - normal              # no processing
+    - high_contrast       # CLAHE — boost contrast without losing colour
+    - inverted            # photographic negative (white text on dark)
+    - binary              # pure black & white text (adaptive threshold)
+    - yellow_on_black     # high-contrast yellow text on black background
+    # - grayscale         # uncomment to enable
+    # - white_on_black    # extreme contrast; uncomment for severe low-vision
+
+  # Per-filter parameters. The defaults shown here are what we
+  # found worked well in early testing; tweak per child.
+  #
+  # block_size MUST be an odd integer ≥ 3 (OpenCV requirement).
+  # Larger block_size = smoother, less reactive to small detail.
+  # offset is the threshold constant — raise it if faint ink is
+  # being dropped, lower it if backgrounds come out speckled.
+  config:
+    binary:
+      block_size: 21
+      offset: 10
+    yellow_on_black:
+      block_size: 21
+      offset: 10
+    white_on_black:
+      block_size: 21
+      offset: 10
+    high_contrast:
+      clip_limit: 3.0     # 1.0 gentle, 3.0 default, 4.0+ may add noise
+      tile_size: 8        # smaller = more local contrast
 
 # --- Image capture ------------------------------------------------
 capture:

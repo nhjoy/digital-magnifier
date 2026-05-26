@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import cv2
 import numpy as np
@@ -88,6 +88,7 @@ class Gallery:
         display_height: int,
         filters_available: list[str],
         initial_filter: str = "normal",
+        filter_config: Optional[dict[str, dict[str, Any]]] = None,
         zoom_min: float = 1.0,
         zoom_max: float = 8.0,
         zoom_step: float = 0.5,
@@ -102,6 +103,7 @@ class Gallery:
         if not self._filters_available:
             self._filters_available = ["normal"]
         self._initial_filter = initial_filter
+        self._filter_config = filter_config or {}
         self._zoom_min = float(zoom_min)
         self._zoom_max = float(zoom_max)
         self._zoom_step = float(zoom_step)
@@ -340,7 +342,7 @@ class Gallery:
             )
 
         zoomed = apply_zoom(image, self._zoom, self._pan_x, self._pan_y)
-        filtered = apply_filter(zoomed, self._current_filter())
+        filtered = apply_filter(zoomed, self._current_filter(), self._filter_config)
 
         # Resize to match the display canvas so the overlay sits
         # at expected positions regardless of source resolution.

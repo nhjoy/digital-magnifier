@@ -69,10 +69,16 @@ class FakeImageSaver:
         self.saved_frames.append(frame.copy())
         return Path(f"/tmp/fake/img_{len(self.saved_frames):04d}.png")
 
+    def list_images(self, newest_first=True):
+        return []
+
+    def delete_image(self, path):
+        pass
+
 
 def make_config():
     return {
-        "app": {"target_fps": 1000, "show_overlay": False},
+        "app": {"target_fps": 1000, "show_overlay": False, "splash_duration_s": 0},
         "magnifier": {
             "min_zoom": 1.0, "max_zoom": 4.0,
             "zoom_step": 1.0, "default_zoom": 1.0, "pan_step": 0.5,

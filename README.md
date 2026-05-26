@@ -3,42 +3,59 @@
 Portable digital magnifier for low-vision children, built on a Raspberry Pi
 Compute Module 5 with the Pi Camera Module 3.
 
-**Current version: MVP 0.3** — real GPIO controls via I²C I/O expander.
+**Current version: MVP 0.4** — gallery, buzzer, battery monitoring, status overlay.
+
+See [USER_GUIDE.md](USER_GUIDE.md) for how to use the device (written for
+parents, caregivers, and older children).
 
 ## What works
 
 - Live magnified view from the Pi Camera Module 3 (or a USB webcam / synthetic
   frame on a dev machine)
 - Digital zoom 1× to 8× with digital pan
-- Five vision filters: normal, grayscale, high-contrast (CLAHE),
-  inverted, binary (adaptive threshold)
-- Freeze / unfreeze with frozen-frame cache
-- Capture-to-disk with timestamped PNGs
-- Reset view (one-press return to defaults)
-- Resilient main loop — bad frames, save failures, and handler exceptions
-  are logged but never crash the device
+- Seven vision filters (configurable in YAML): normal, grayscale,
+  high-contrast (CLAHE), inverted, binary, yellow-on-black, white-on-black
+- Filter parameters adjustable in `config/app_config.yaml` (block size,
+  threshold offset, CLAHE clip limit) — no code changes needed
+- Freeze / unfreeze with frozen-frame cache (snapshot button tap)
+- Capture-to-disk with timestamped PNGs (snapshot button 3s hold)
+- Gallery UI: browse, zoom, filter, and delete captured images
+- Reset view (one-press return to defaults via nav centre)
+- **Buzzer feedback** (PS1740P02E passive piezo at 4 kHz): startup, shutdown,
+  low-battery alerts, and audio cues
+- **Battery monitoring** via Waveshare UPS HAT (E) at I²C 0x2D: live battery
+  bar in the overlay, one-time 50% warning, continuous 15% alert (1 Hz beep),
+  automatic safe shutdown at 10%
+- **Status overlay**: hold ADD3 for 5 seconds to see a fullscreen device
+  status screen (battery, mode, zoom, filter, photo count)
+- **Loading splash**: 5-second startup splash with progress dots while the
+  camera initialises
+- Enhanced state-aware overlay with colour-coded state labels and battery bar
 - Pi Cam 3 continuous autofocus, configurable AWB / AE / HDR / rotation
 - Fullscreen display on the DSI panel
-- **GPIO controls (MVP 0.3)**: navigation switch + 6 buttons via a TCA6416A
-  I²C I/O expander (0x20), keyboard fallback when GPIO isn't available
+- **GPIO controls**: navigation switch + 6 buttons via TCA6416A I²C I/O
+  expander (0x20), keyboard fallback when GPIO isn't available
+- **Hardware power button** on GPIO 26 via `dtoverlay=gpio-shutdown` — clean
+  OS-level shutdown, separate from app logic
+- Resilient main loop — bad frames, save failures, and handler exceptions
+  are logged but never crash the device
 
 ## Stubbed (deferred to later MVPs)
 
 - Zoom potentiometer via MCP3221 ADC — driver written, awaiting hardware.
   ADD1 / ADD2 buttons stand in for ZOOM_IN / ZOOM_OUT until the ADC arrives.
 - RGB status LED — pins are configured as outputs but not yet wired into
-  app logic (MVP 0.4)
-- Gallery UI showing captured images (MVP 0.4)
-- Menu UI (MVP 0.4)
-- Accessibility polish, audio feedback (MVP 0.4)
-- systemd auto-start, watchdog, safe shutdown (MVP 0.5)
+  app logic (MVP 0.5)
+- Menu UI (MVP 0.5)
+- systemd auto-start, watchdog (MVP 0.5)
 
 ## Project layout
 
 ```
 digital-magnifier/
 ├── pyproject.toml             # package definition + dependencies
-├── README.md
+├── README.md                  # developer documentation (this file)
+├── USER_GUIDE.md              # how-to for parents and caregivers
 ├── .gitignore
 ├── config/
 │   ├── app_config.yaml        # app behaviour, filters, capture, logging
@@ -48,28 +65,31 @@ digital-magnifier/
 │   └── digital_magnifier/
 │       ├── main.py
 │       ├── core/
-│       │   ├── app_controller.py    # main orchestrator
-│       │   ├── events.py            # AppEvent enum
-│       │   └── state_machine.py
+│       │   ├── events.py          # AppEvent enum
+│       │   ├── state_machine.py   # AppState + transitions
+│       │   ├── app_controller.py  # main orchestrator
+│       │   └── gallery.py         # gallery UI
 │       ├── hal/
-│       │   ├── camera_base.py       # CameraSensor ABC
-│       │   ├── camera_sensor.py     # MockCameraSensor + PiCameraSensor
-│       │   ├── controls_base.py     # ControlsHAL ABC
-│       │   ├── i2c_devices.py       # TCA6416A + MCP3221 drivers
-│       │   └── mock_controls.py     # MockControls (keyboard) + GPIOControls
+│       │   ├── camera_base.py     # CameraSensor ABC
+│       │   ├── camera_sensor.py   # webcam / synthetic backends
+│       │   ├── pi_camera_sensor.py# Pi Camera Module 3 backend
+│       │   ├── controls_base.py   # ControlsHAL ABC
+│       │   ├── mock_controls.py   # keyboard + GPIO controls
+│       │   ├── i2c_devices.py     # TCA6416A, MCP3221, UPS HAT (E)
+│       │   └── buzzer.py          # PS1740P02E passive piezo driver
 │       ├── processing/
-│       │   ├── magnifier.py         # apply_zoom (digital zoom + pan)
-│       │   └── vision_filters.py    # filters incl. adaptive-threshold binary
+│       │   ├── magnifier.py       # apply_zoom
+│       │   └── vision_filters.py  # apply_filter + 7 filters
 │       ├── storage/
-│       │   └── image_saver.py
+│       │   └── image_saver.py     # timestamped PNG saving + listing
 │       └── utils/
 │           ├── config_loader.py
 │           └── logger.py
 ├── tests/
-│   └── unit/                  # 280+ pytest tests
+│   ├── unit/                  # 370+ pytest tests
+│   └── hardware/              # on-device probes (buzzer, UPS, I2C)
 ├── scripts/
 │   └── dev/                   # alternative test runners + MVP milestone proofs
-│                              # see scripts/dev/README.md
 └── captures/                  # output of capture button (gitignored)
 ```
 

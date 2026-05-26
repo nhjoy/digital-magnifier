@@ -136,6 +136,7 @@ IN_STATE_EVENTS: dict[AppState, frozenset[AppEvent]] = {
         AppEvent.PAN_RIGHT,
         AppEvent.FILTER_NEXT,
         AppEvent.RESET_VIEW,
+        AppEvent.STATUS_TOGGLE,
     }),
 
     AppState.FROZEN_VIEW: frozenset({
@@ -147,6 +148,7 @@ IN_STATE_EVENTS: dict[AppState, frozenset[AppEvent]] = {
         AppEvent.PAN_RIGHT,
         AppEvent.FILTER_NEXT,
         AppEvent.RESET_VIEW,
+        AppEvent.STATUS_TOGGLE,
     }),
 
     # During the brief capture-flash, ignore all user input except

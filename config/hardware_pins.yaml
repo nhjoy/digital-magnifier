@@ -122,7 +122,7 @@ button_events:
   clr_btn:     FILTER_NEXT      # was RESET_VIEW (now lives on nav centre)
   add1:        ZOOM_IN          # temporary — post-ADC moves to FREEZE_TOGGLE
   add2:        ZOOM_OUT         # temporary — post-ADC moves to FILTER_NEXT
-  # add3 → power button, handled specially (short vs long press).
+  # add3 → status button, handled specially (5-second hold for fullscreen status).
   # snapshot → snapshot button, handled specially (tap vs hold).
 
 # Snapshot button: tap/release = freeze/unfreeze, hold 3 seconds = capture.
@@ -160,14 +160,20 @@ nav_repeat:
   initial_delay_ms: 400        # wait this long before first repeat
   interval_ms: 100             # then emit one repeat every interval
 
-# Power button (mapped to ``add3`` above). Press shorter than the
-# threshold = POWER_SHORT_PRESS (opens menu). Press held longer than
-# the threshold = POWER_LONG_PRESS (clean shutdown). The long event
-# fires the moment the threshold is crossed, not on release, so the
-# user gets immediate feedback when they hold for shutdown.
-power_button:
+# ADD3 — status overlay button.
+#
+# Power is handled at the OS level via the gpio-shutdown device-tree
+# overlay on GPIO 26 (see /boot/firmware/config.txt). That makes ADD3
+# free for a different role: holding it for 5 seconds toggles a
+# fullscreen status screen showing battery percentage, current state,
+# zoom level, and active filter — useful for the child to glance at
+# device health without entering the menu.
+status_button:
   input: add3
-  long_press_threshold_ms: 1000
+  long_event: STATUS_TOGGLE
+  long_press_threshold_ms: 5000
+  # No short_event — a tap is intentionally a no-op so brushing
+  # against the button doesn't pop up the status screen.
 
 # ===================================================================
 # 5. Zoom potentiometer calibration (MCP3221 path)

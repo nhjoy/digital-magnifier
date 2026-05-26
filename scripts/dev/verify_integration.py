@@ -363,7 +363,7 @@ class EndToEndTests(unittest.TestCase):
             # Pan was applied
             self.assertGreater(app._pan_x, 0)
             # Filter advanced
-            self.assertEqual(app._current_filter(), "grayscale")
+            self.assertEqual(app._current_filter(), "high_contrast")
 
 
 if __name__ == "__main__":

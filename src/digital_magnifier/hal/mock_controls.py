@@ -205,14 +205,17 @@ class _TimedButtonState:
     fire on *release* if held less than ``threshold_s`` (short event) or
     as soon as the hold threshold is reached (long event). The long event
     fires once; subsequent release is a no-op to avoid double-firing.
+
+    Either ``short_event`` or ``long_event`` may be None — for example,
+    the status button has only a long press (no useful short action).
     """
     __slots__ = ("short_event", "long_event", "threshold_s",
                  "pressed_at", "long_fired")
 
     def __init__(
         self,
-        short_event: AppEvent,
-        long_event: AppEvent,
+        short_event: Optional[AppEvent],
+        long_event: Optional[AppEvent],
         threshold_s: float,
     ) -> None:
         self.short_event = short_event
@@ -471,7 +474,7 @@ class GPIOControls(ControlsHAL):
         # threshold wasn't reached; if it was, long already fired.
         tb = self._timed_buttons.get(name)
         if tb is not None:
-            if not tb.long_fired:
+            if not tb.long_fired and tb.short_event is not None:
                 press_start = self._press_started.get(name)
                 if press_start is not None:
                     if (now - press_start) < tb.threshold_s:
@@ -485,7 +488,7 @@ class GPIOControls(ControlsHAL):
 
     def _process_long_press(self, inputs: int, now: float) -> None:
         for name, tb in self._timed_buttons.items():
-            if tb.long_fired:
+            if tb.long_fired or tb.long_event is None:
                 continue
             press_start = self._press_started.get(name)
             if press_start is None:
@@ -707,6 +710,46 @@ class GPIOControls(ControlsHAL):
                     snap_input,
                 )
 
+        # Status button: long press shows fullscreen status overlay.
+        # No short_event (a tap does nothing).
+        status_cfg = cfg.get("status_button", {})
+        status_input = status_cfg.get("input")
+        if status_input:
+            if status_input in self._input_pins:
+                short_raw = status_cfg.get("short_event")
+                long_raw = status_cfg.get("long_event")
+                short_ev = (
+                    self._parse_event(short_raw, "status_button.short_event")
+                    if short_raw else None
+                )
+                long_ev = (
+                    self._parse_event(long_raw, "status_button.long_event")
+                    if long_raw else None
+                )
+                if short_ev is not None or long_ev is not None:
+                    try:
+                        threshold_ms = int(
+                            status_cfg.get("long_press_threshold_ms", 5000)
+                        )
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "status_button.long_press_threshold_ms "
+                            "invalid; using 5000"
+                        )
+                        threshold_ms = 5000
+                    self._timed_buttons[status_input] = _TimedButtonState(
+                        short_event=short_ev,
+                        long_event=long_ev,
+                        threshold_s=threshold_ms / 1000.0,
+                    )
+                    self._press_started.setdefault(status_input, None)
+            else:
+                logger.warning(
+                    "status_button.input %r is not a defined input; "
+                    "status button disabled",
+                    status_input,
+                )
+
         # --- Poll interval ------------------------------------
         io_cfg = (
             cfg.get("i2c", {}).get("devices", {}).get("io_expander", {})
@@ -734,7 +777,8 @@ class GPIOControls(ControlsHAL):
             self._zoom_debounce_reads = 2
 
         timed_names = ", ".join(
-            f"{n}(short={tb.short_event.name}, long={tb.long_event.name})"
+            f"{n}(short={getattr(tb.short_event, 'name', 'none')}, "
+            f"long={getattr(tb.long_event, 'name', 'none')})"
             for n, tb in self._timed_buttons.items()
         ) or "none"
         logger.info(

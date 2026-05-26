@@ -12,6 +12,8 @@ from digital_magnifier.processing.vision_filters import (
     FILTER_HIGH_CONTRAST,
     FILTER_INVERTED,
     FILTER_NORMAL,
+    FILTER_YELLOW_ON_BLACK,
+    FILTER_WHITE_ON_BLACK,
     apply_filter,
 )
 
@@ -114,3 +116,63 @@ class TestUnknownFilter:
             result = apply_filter(frame, "definitely_not_a_real_filter")
         assert np.array_equal(result, frame)
         assert any("unknown filter" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# yellow_on_black: output is only black (0,0,0) or yellow (0,G,R)
+# --------------------------------------------------------------------------- #
+class TestYellowOnBlack:
+    def test_only_yellow_and_black(self, frame):
+        result = apply_filter(frame, FILTER_YELLOW_ON_BLACK)
+        # Blue channel should be all zeros (no blue component).
+        assert np.all(result[..., 0] == 0), "yellow_on_black should have no blue"
+        # Green and red channels should be identical (both are the mask).
+        assert np.array_equal(result[..., 1], result[..., 2])
+
+    def test_only_extreme_values_in_mask(self, frame):
+        result = apply_filter(frame, FILTER_YELLOW_ON_BLACK)
+        unique_g = np.unique(result[..., 1])
+        assert set(unique_g.tolist()).issubset({0, 255})
+
+
+# --------------------------------------------------------------------------- #
+# white_on_black: output is greyscale binary (only 0 or 255)
+# --------------------------------------------------------------------------- #
+class TestWhiteOnBlack:
+    def test_only_extreme_values(self, frame):
+        result = apply_filter(frame, FILTER_WHITE_ON_BLACK)
+        unique_values = np.unique(result)
+        assert set(unique_values.tolist()).issubset({0, 255})
+
+    def test_channels_are_equal(self, frame):
+        result = apply_filter(frame, FILTER_WHITE_ON_BLACK)
+        assert np.array_equal(result[..., 0], result[..., 1])
+        assert np.array_equal(result[..., 1], result[..., 2])
+
+
+# --------------------------------------------------------------------------- #
+# Config parameter passing
+# --------------------------------------------------------------------------- #
+class TestConfigPassthrough:
+    def test_binary_with_custom_block_size(self, frame):
+        cfg = {"binary": {"block_size": 51, "offset": 5}}
+        result = apply_filter(frame, FILTER_BINARY, config=cfg)
+        assert result.shape == frame.shape
+        unique = np.unique(result)
+        assert set(unique.tolist()).issubset({0, 255})
+
+    def test_high_contrast_with_custom_clip_limit(self, frame):
+        cfg = {"high_contrast": {"clip_limit": 1.0, "tile_size": 4}}
+        result = apply_filter(frame, FILTER_HIGH_CONTRAST, config=cfg)
+        assert result.shape == frame.shape
+        assert not np.array_equal(result, frame)
+
+    def test_config_for_wrong_filter_is_ignored(self, frame):
+        # Config dict has binary params but we call high_contrast
+        cfg = {"binary": {"block_size": 99}}
+        result = apply_filter(frame, FILTER_HIGH_CONTRAST, config=cfg)
+        assert result.shape == frame.shape
+
+    def test_none_config_is_safe(self, frame):
+        result = apply_filter(frame, FILTER_BINARY, config=None)
+        assert result.shape == frame.shape
